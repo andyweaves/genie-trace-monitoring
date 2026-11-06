@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1060 420" width="100%" style="max-width:1060px;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5c6b73"/>
+    </marker>
+    <style>
+      .col   { font-size:13px; font-weight:600; fill:#1b3139; }
+      .sub   { font-size:11px; fill:#5c6b73; }
+      .box   { fill:#f5f7fa; stroke:#1b3139; stroke-width:1.5; rx:8; }
+      .src   { fill:#eef2f6; stroke:#5c6b73; stroke-dasharray:4 3; }
+      .det   { fill:#fff4e5; stroke:#b86e00; }
+      .gold  { fill:#e8f3ec; stroke:#1f7a4d; }
+      .view  { fill:#ffffff; stroke:#1f7a4d; stroke-dasharray:4 3; }
+      .name  { font-family:SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; font-weight:700; fill:#1b3139; }
+      .desc  { font-size:11px; fill:#3b4a52; }
+      .edge  { fill:none; stroke:#5c6b73; stroke-width:1.5; marker-end:url(#arrow); }
+      .lbl   { font-size:10.5px; fill:#5c6b73; }
+    </style>
+  </defs>
+  <rect width="1060" height="420" fill="#ffffff"/>
+
+  <!-- column headers -->
+  <text x="130" y="26" text-anchor="middle" class="col">1 · Source</text>
+  <text x="130" y="42" text-anchor="middle" class="sub">Unity Gateway unified trace table</text>
+  <text x="400" y="26" text-anchor="middle" class="col">2 · Flatten</text>
+  <text x="400" y="42" text-anchor="middle" class="sub">pipeline genie_tracing_etl · MVs</text>
+  <text x="660" y="26" text-anchor="middle" class="col">3 · Detect</text>
+  <text x="660" y="42" text-anchor="middle" class="sub">job tasks 02 PII · 03 injection · 04 guardrails</text>
+  <text x="920" y="26" text-anchor="middle" class="col">4 · Roll up</text>
+  <text x="920" y="42" text-anchor="middle" class="sub">pipeline genie_tracing_sessions</text>
+
+  <!-- column 1 -->
+  <rect x="30" y="70" width="200" height="90" class="box src"/>
+  <text x="130" y="95" text-anchor="middle" class="name">unity_gateway_otel_spans</text>
+  <text x="130" y="115" text-anchor="middle" class="desc">raw OpenTelemetry spans</text>
+  <text x="130" y="131" text-anchor="middle" class="desc">Genie + AI Gateway model traffic</text>
+  <text x="130" y="147" text-anchor="middle" class="desc">filter: service_name</text>
+
+  <rect x="30" y="270" width="200" height="70" class="box src"/>
+  <text x="130" y="295" text-anchor="middle" class="name">…_otel_annotations</text>
+  <text x="130" y="315" text-anchor="middle" class="desc">👍 / 👎 feedback per trace</text>
+
+  <!-- column 2 -->
+  <rect x="300" y="70" width="200" height="70" class="box"/>
+  <text x="400" y="95" text-anchor="middle" class="name">genie_turns</text>
+  <text x="400" y="115" text-anchor="middle" class="desc">1 row per turn (trace_id)</text>
+  <text x="400" y="130" text-anchor="middle" class="desc">prompt · response · who · outcome</text>
+
+  <rect x="300" y="170" width="200" height="70" class="box"/>
+  <text x="400" y="195" text-anchor="middle" class="name">genie_tool_calls</text>
+  <text x="400" y="215" text-anchor="middle" class="desc">1 row per action (span_id)</text>
+  <text x="400" y="230" text-anchor="middle" class="desc">SQL run · assets edited · approvals</text>
+
+  <!-- column 3 -->
+  <rect x="560" y="120" width="200" height="90" class="box det"/>
+  <text x="660" y="145" text-anchor="middle" class="name">genie_detections</text>
+  <text x="660" y="165" text-anchor="middle" class="desc">1 row per span × detector × field</text>
+  <text x="660" y="181" text-anchor="middle" class="desc">flagged · score · label · evidence</text>
+  <text x="660" y="197" text-anchor="middle" class="desc">Presidio · Prompt Guard · rules</text>
+
+  <!-- column 4 -->
+  <rect x="820" y="120" width="200" height="90" class="box gold"/>
+  <text x="920" y="145" text-anchor="middle" class="name">genie_sessions</text>
+  <text x="920" y="165" text-anchor="middle" class="desc">1 row per conversation</text>
+  <text x="920" y="181" text-anchor="middle" class="desc">rollups · has_pii · has_injection</text>
+  <text x="920" y="197" text-anchor="middle" class="desc">has_guardrail_signal · risk_score</text>
+
+  <rect x="820" y="270" width="200" height="70" class="box view"/>
+  <text x="920" y="295" text-anchor="middle" class="name">genie_session_timeline</text>
+  <text x="920" y="315" text-anchor="middle" class="desc">view · 1 row per step, in order</text>
+  <text x="920" y="330" text-anchor="middle" class="desc">turns + tool calls + flags</text>
+
+  <!-- edges: source -> flatten -->
+  <path d="M230,105 L300,105" class="edge"/>
+  <path d="M230,125 C265,125 265,205 300,205" class="edge"/>
+
+  <!-- edges: flatten -> detect -->
+  <path d="M500,105 C530,105 530,150 560,150" class="edge"/>
+  <path d="M500,205 C530,205 530,180 560,180" class="edge"/>
+
+  <!-- edges: detect -> roll up -->
+  <path d="M760,165 L820,165" class="edge"/>
+
+  <!-- edges: flatten -> sessions (around detections) -->
+  <path d="M500,85 L790,85 C805,85 805,150 820,150" class="edge"/>
+  <path d="M500,235 L790,235 C805,235 805,180 820,180" class="edge"/>
+
+  <!-- edge: annotations -> sessions -->
+  <path d="M230,305 L790,305 C805,305 805,195 820,195" class="edge"/>
+
+  <!-- edges into timeline -->
+  <path d="M660,210 L660,370 L790,370 C805,370 805,320 820,320" class="edge"/>
+  <text x="725" y="384" text-anchor="middle" class="lbl">timeline reads turns, tool calls and detections</text>
+
+  <!-- legend -->
+  <rect x="30" y="392" width="14" height="10" class="box src"/>
+  <text x="50" y="401" class="lbl">raw source (not owned by the bundle)</text>
+  <rect x="300" y="392" width="14" height="10" class="box"/>
+  <text x="320" y="401" class="lbl">materialized view</text>
+  <rect x="460" y="392" width="14" height="10" class="box det"/>
+  <text x="480" y="401" class="lbl">Delta table, MERGEd by detectors</text>
+  <rect x="720" y="392" width="14" height="10" class="box gold"/>
+  <text x="740" y="401" class="lbl">triage entry point (start here)</text>
+</svg>

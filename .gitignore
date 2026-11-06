@@ -1,0 +1,21 @@
+# Databricks Asset Bundle state and local overrides
+.databricks/
+*.local.yml
+!*.local.yml.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local artefacts
+*.log
+.env

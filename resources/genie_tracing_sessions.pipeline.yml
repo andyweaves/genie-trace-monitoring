@@ -1,0 +1,20 @@
+resources:
+  pipelines:
+    genie_tracing_sessions:
+      name: "[${bundle.target}] genie_tracing_sessions"
+      catalog: ${var.catalog}
+      schema: ${resources.schemas.genie_tracing.name}
+      serverless: true
+      continuous: false
+      channel: CURRENT
+      photon: true
+
+      root_path: ../src/pipelines/sessions
+      libraries:
+        - glob:
+            include: ../src/pipelines/sessions/transformations/**
+
+      configuration:
+        catalog: ${var.catalog}
+        schema: ${resources.schemas.genie_tracing.name}
+        annotations_table: ${var.annotations_table}

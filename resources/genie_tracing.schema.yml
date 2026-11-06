@@ -1,0 +1,17 @@
+resources:
+  schemas:
+    genie_tracing:
+      catalog_name: ${var.catalog}
+      name: ${var.schema}
+      comment: >
+        Genie One / Genie Code trace monitoring. Flattened turns, tool calls, sessions and
+        detections (PII, prompt injection, guardrail signals) derived from the Unity Gateway
+        unified trace table. Contains full prompt and response text: restrict access.
+
+  volumes:
+    genie_tracing_libs:
+      catalog_name: ${var.catalog}
+      schema_name: ${resources.schemas.genie_tracing.name}
+      name: ${var.libs_volume}
+      volume_type: MANAGED
+      comment: Wheels and model files used by the detection notebooks (spaCy model for Presidio).

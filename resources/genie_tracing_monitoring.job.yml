@@ -1,0 +1,70 @@
+resources:
+  jobs:
+    genie_tracing_monitoring:
+      name: "[${bundle.target}] genie_tracing_monitoring"
+      description: >
+        Flattens Genie One / Genie Code traces, runs PII, prompt-injection and guardrail-signal
+        detections, then rebuilds the session rollups. Alerts run on their own schedule and read
+        the tables this job maintains.
+
+      schedule:
+        quartz_cron_expression: "0 15 * * * ?" # hourly at :15
+        timezone_id: UTC
+        pause_status: ${var.schedule_pause_status}
+
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${resources.schemas.genie_tracing.name}
+        - name: libs_volume
+          default: ${var.libs_volume}
+        - name: prompt_guard_endpoint
+          default: ${var.prompt_guard_endpoint}
+        - name: lookback_days
+          default: ${var.detection_lookback_days}
+
+      environments:
+        - environment_key: detections
+          spec:
+            environment_version: "4"
+            dependencies:
+              - presidio-analyzer>=2.2,<3
+              - presidio-anonymizer>=2.2,<3
+              - spacy>=3.8,<3.9
+              # spaCy English model staged in the libs volume by 00_setup.
+              - /Volumes/${var.catalog}/${var.schema}/${var.libs_volume}/wheels/en_core_web_md-3.8.0-py3-none-any.whl
+
+      tasks:
+        - task_key: etl_pipeline
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.genie_tracing_etl.id}
+
+        - task_key: detect_pii
+          depends_on:
+            - task_key: etl_pipeline
+          environment_key: detections
+          notebook_task:
+            notebook_path: ../src/notebooks/02_detect_pii.py
+
+        - task_key: detect_prompt_injection
+          depends_on:
+            - task_key: etl_pipeline
+          environment_key: detections
+          notebook_task:
+            notebook_path: ../src/notebooks/03_detect_prompt_injection.py
+
+        - task_key: detect_guardrail_signals
+          depends_on:
+            - task_key: etl_pipeline
+          environment_key: detections
+          notebook_task:
+            notebook_path: ../src/notebooks/04_detect_guardrail_signals.py
+
+        - task_key: sessions_pipeline
+          depends_on:
+            - task_key: detect_pii
+            - task_key: detect_prompt_injection
+            - task_key: detect_guardrail_signals
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.genie_tracing_sessions.id}

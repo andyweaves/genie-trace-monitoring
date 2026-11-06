@@ -1,0 +1,108 @@
+# SQL Alerts (v2). Each alert counts newly flagged items since the previous hourly run and
+# fires when the count is greater than zero. Adjust the cron and lookback together.
+resources:
+  alerts:
+    genie_pii_detected:
+      display_name: "[${bundle.target}] Genie: PII detected in prompts or responses"
+      warehouse_id: ${var.warehouse_id}
+      query_text: |
+        SELECT COUNT(DISTINCT conversation_id) AS flagged_sessions
+        FROM ${var.catalog}.${var.schema}.genie_detections
+        WHERE detector LIKE 'pii_%'
+          AND flagged
+          AND detected_at >= current_timestamp() - INTERVAL 1 HOUR
+      evaluation:
+        comparison_operator: GREATER_THAN
+        source:
+          name: flagged_sessions
+          display: flagged_sessions
+        threshold:
+          value:
+            double_value: 0
+        notification:
+          notify_on_ok: false
+          subscriptions:
+            - user_email: ${var.alert_email}
+      schedule:
+        pause_status: ${var.schedule_pause_status}
+        quartz_cron_schedule: "0 45 * * * ?"
+        timezone_id: UTC
+
+    genie_prompt_injection_detected:
+      display_name: "[${bundle.target}] Genie: possible prompt injection or jailbreak"
+      warehouse_id: ${var.warehouse_id}
+      query_text: |
+        SELECT COUNT(DISTINCT conversation_id) AS flagged_sessions
+        FROM ${var.catalog}.${var.schema}.genie_detections
+        WHERE detector LIKE 'prompt_injection_%'
+          AND flagged
+          AND detected_at >= current_timestamp() - INTERVAL 1 HOUR
+      evaluation:
+        comparison_operator: GREATER_THAN
+        source:
+          name: flagged_sessions
+          display: flagged_sessions
+        threshold:
+          value:
+            double_value: 0
+        notification:
+          notify_on_ok: false
+          subscriptions:
+            - user_email: ${var.alert_email}
+      schedule:
+        pause_status: ${var.schedule_pause_status}
+        quartz_cron_schedule: "0 45 * * * ?"
+        timezone_id: UTC
+
+    genie_guardrail_signals:
+      display_name: "[${bundle.target}] Genie: guardrail or boundary-pushing signals"
+      warehouse_id: ${var.warehouse_id}
+      query_text: |
+        SELECT COUNT(DISTINCT conversation_id) AS flagged_sessions
+        FROM ${var.catalog}.${var.schema}.genie_detections
+        WHERE detector = 'guardrail_signal'
+          AND flagged
+          AND score >= 0.5
+          AND detected_at >= current_timestamp() - INTERVAL 1 HOUR
+      evaluation:
+        comparison_operator: GREATER_THAN
+        source:
+          name: flagged_sessions
+          display: flagged_sessions
+        threshold:
+          value:
+            double_value: 0
+        notification:
+          notify_on_ok: false
+          subscriptions:
+            - user_email: ${var.alert_email}
+      schedule:
+        pause_status: ${var.schedule_pause_status}
+        quartz_cron_schedule: "0 45 * * * ?"
+        timezone_id: UTC
+
+    genie_high_risk_sessions:
+      display_name: "[${bundle.target}] Genie: high-risk sessions (risk_score >= 0.8)"
+      warehouse_id: ${var.warehouse_id}
+      query_text: |
+        SELECT COUNT(*) AS high_risk_sessions
+        FROM ${var.catalog}.${var.schema}.genie_sessions
+        WHERE is_flagged
+          AND risk_score >= 0.8
+          AND flags.last_flagged_at >= current_timestamp() - INTERVAL 1 HOUR
+      evaluation:
+        comparison_operator: GREATER_THAN
+        source:
+          name: high_risk_sessions
+          display: high_risk_sessions
+        threshold:
+          value:
+            double_value: 0
+        notification:
+          notify_on_ok: false
+          subscriptions:
+            - user_email: ${var.alert_email}
+      schedule:
+        pause_status: ${var.schedule_pause_status}
+        quartz_cron_schedule: "0 50 * * * ?"
+        timezone_id: UTC

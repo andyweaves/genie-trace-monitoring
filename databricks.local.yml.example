@@ -1,0 +1,11 @@
+# Copy to databricks.local.yml (gitignored) and fill in your workspace details.
+# Anything here merges over databricks.yml for the matching target.
+targets:
+  dev:
+    workspace:
+      profile: my-profile                  # name in ~/.databrickscfg
+      host: https://my-workspace.cloud.databricks.com
+    variables:
+      warehouse_name: My SQL Warehouse     # existing SQL warehouse for the alerts
+      # catalog: unity_gateway
+      # source_table: unity_gateway.unified_tracing.unity_gateway_otel_spans

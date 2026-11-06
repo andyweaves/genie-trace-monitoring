@@ -1,0 +1,77 @@
+bundle:
+  name: genie-trace-monitoring
+
+include:
+  - resources/*.yml
+  # Optional, gitignored: put your own profile / warehouse / target overrides here.
+  # See databricks.local.yml.example.
+  - "*.local.yml"
+
+variables:
+  # Where the Genie trace monitoring tables are created.
+  catalog:
+    description: Catalog for the genie_tracing schema and all derived tables.
+    default: unity_gateway
+  schema:
+    description: Schema for all derived tables, views, volumes and detections.
+    default: genie_tracing
+
+  # The Unity Gateway unified trace table that Genie One / Genie Code write to.
+  source_table:
+    description: Fully qualified name of the unified trace (OTel spans) table.
+    default: unity_gateway.unified_tracing.unity_gateway_otel_spans
+  annotations_table:
+    description: Fully qualified name of the unified trace annotations table (thumbs up/down).
+    default: unity_gateway.unified_tracing.unity_gateway_otel_annotations
+
+  # service_name values used by Genie products in the trace table.
+  genie_one_service:
+    default: Genie One
+  genie_code_service:
+    default: genie-code-agent
+
+  # Model serving endpoint hosting Llama Prompt Guard 2 (deployed by 01_deploy_prompt_guard).
+  prompt_guard_endpoint:
+    default: genie-prompt-guard-2
+
+  # Volume used to stage wheels (spaCy model for Presidio).
+  libs_volume:
+    default: genie_tracing_libs
+
+  # How far back each detection run looks for un-scanned spans.
+  detection_lookback_days:
+    default: "7"
+
+  # SQL warehouse used by alerts, resolved by name at deploy time.
+  warehouse_name:
+    description: Name of an existing SQL warehouse to run the alerts on.
+    default: Serverless Starter Warehouse
+  warehouse_id:
+    description: SQL warehouse ID for alerts (looked up from warehouse_name).
+    lookup:
+      warehouse: ${var.warehouse_name}
+
+  # Schedules are paused by default so a fresh deployment does not start billing.
+  schedule_pause_status:
+    default: PAUSED
+
+  alert_email:
+    description: Email address that receives alert notifications.
+    default: ${workspace.current_user.userName}
+
+# Targets deliberately carry no workspace host or profile: pass `--profile <name>` on the CLI,
+# or add a gitignored databricks.local.yml (see databricks.local.yml.example).
+targets:
+  dev:
+    default: true
+    # No `mode: development` on purpose: it would prefix the schema name (dev_<user>_genie_tracing)
+    # and the volume path baked into the job environment. Schedules are paused via variables instead.
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      schedule_pause_status: UNPAUSED
+    run_as:
+      user_name: ${workspace.current_user.userName}
