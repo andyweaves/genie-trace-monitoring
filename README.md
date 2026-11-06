@@ -36,54 +36,14 @@ Customers adopting Genie raise three concerns that the product does not answer o
 
 ### Data flow
 
-```mermaid
-flowchart LR
-    subgraph src["1 · Source · Unity Gateway unified trace table"]
-        spans["unity_gateway_otel_spans<br/><i>raw OTel spans, Genie + model traffic</i>"]
-        annots["unity_gateway_otel_annotations<br/><i>👍 / 👎 feedback</i>"]
-    end
+![How the tables fit together](src/notebooks/images/table_guide_architecture.png)
 
-    subgraph etl["2 · Flatten · pipeline genie_tracing_etl"]
-        turns["genie_turns<br/><i>1 row per turn: prompt, response, outcome</i>"]
-        tools["genie_tool_calls<br/><i>1 row per action: SQL run, assets edited, approvals</i>"]
-    end
-
-    subgraph det["3 · Detect · job tasks"]
-        detections["genie_detections<br/><i>1 row per span × detector × field</i>"]
-    end
-
-    subgraph roll["4 · Roll up · pipeline genie_tracing_sessions"]
-        sessions["genie_sessions<br/><i>1 row per conversation: is_flagged, risk_score</i>"]
-        timeline["genie_session_timeline<br/><i>view: ordered steps with flags</i>"]
-    end
-
-    alerts["SQL alerts<br/><i>PII · injection · guardrail · high risk</i>"]
-
-    spans --> turns
-    spans --> tools
-    turns --> detections
-    tools --> detections
-    turns --> sessions
-    tools --> sessions
-    detections --> sessions
-    annots --> sessions
-    turns --> timeline
-    tools --> timeline
-    detections --> timeline
-    sessions --> alerts
-    detections --> alerts
-
-    classDef source fill:#eef2f6,stroke:#5c6b73,stroke-dasharray:4 3,color:#1b3139
-    classDef mv fill:#f5f7fa,stroke:#1b3139,color:#1b3139
-    classDef table fill:#fff4e5,stroke:#b86e00,color:#1b3139
-    classDef gold fill:#e8f3ec,stroke:#1f7a4d,color:#1b3139
-    classDef alert fill:#fdecec,stroke:#b42318,color:#1b3139
-    class spans,annots source
-    class turns,tools mv
-    class detections table
-    class sessions,timeline gold
-    class alerts alert
-```
+Four stages, left to right: the raw Unity Gateway spans are flattened into turns and tool calls,
+the detectors scan every free-text field and write one row per finding, and the session rollup
+joins it all back together per conversation. Dashed boxes are sources the bundle does not own;
+the orange table is the only one written by notebooks rather than a pipeline; green is where
+triage starts. Source SVG: `docs/table_guide_architecture.svg`, rendered by
+`docs/render_diagram.sh`.
 
 ### What runs when
 
@@ -276,9 +236,9 @@ was rejected). Weights live in `src/pipelines/sessions/transformations/genie_ses
   last cell of that notebook lists recent non-success turns to mine for it.
 * **Scan scope**: a model-call output identical to the turn's final response is scanned once, as
   the response. Guardrail rules clear and re-score their lookback window on every run.
-* **Diagram**: `src/notebooks/images/table_guide_architecture.png` (embedded in `06_table_guide`)
-  is rendered from `docs/table_guide_architecture.svg` by `docs/render_diagram.sh`. Re-render it
-  whenever a table is added, renamed or re-wired.
+* **Diagram**: `src/notebooks/images/table_guide_architecture.png` (used above and in
+  `06_table_guide`) is rendered from `docs/table_guide_architecture.svg` by
+  `docs/render_diagram.sh`. Re-render it whenever a table is added, renamed or re-wired.
 
 ## What the trace does and does not contain
 
