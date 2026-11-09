@@ -1,30 +1,77 @@
-# SQL Alerts (v2). Each alert counts newly flagged items since the previous hourly run and
-# fires when the count is greater than zero. Adjust the cron and lookback together.
+# SQL Alerts (v2), evaluated by alert tasks at the end of the genie_tracing_monitoring job, after
+# genie_sessions has been rebuilt, so they never read half-refreshed tables. Their own schedules
+# stay paused; they exist only because an alert needs one.
+#
+# Each query returns one row per session flagged in the last ${var.alert_lookback_hours} hours
+# (default 24), shown in the notification via @QUERY_RESULT_TABLE. `is_new` = 1 when the session got
+# a finding since the previous job run. Rows are sorted is_new DESC and the alert triggers when the
+# first row's is_new > 0, so it notifies only when something new arrived; the older rows give
+# context. retrigger_seconds = 1 sends a
+# notification on every run that triggers (otherwise only the first trigger notifies).
+#
+# "New" means the last 1 hour, matching the job's hourly cron: change both together.
+#
+# Notifications carry identifiers, labels and scores only, never prompt / response text: alert
+# emails and Slack messages sit outside the access controls in src/sql/access_control.sql.
 resources:
   alerts:
     genie_pii_detected:
       display_name: "[${bundle.target}] Genie: PII detected in prompts or responses"
       warehouse_id: ${var.warehouse_id}
       query_text: |
-        SELECT COUNT(DISTINCT conversation_id) AS flagged_sessions
+        SELECT conversation_id,
+               max(CASE WHEN detected_at >= current_timestamp() - INTERVAL 1 HOUR THEN 1 ELSE 0 END) AS is_new,
+               any_value(product)                                    AS product,
+               any_value(workspace_id)                               AS workspace_id,
+               any_value(requester)                                  AS requester,
+               array_join(array_sort(collect_set(label)), ', ')      AS entity_types,
+               array_join(array_sort(collect_set(span.field)), ', ') AS fields,
+               count(*)                                              AS findings,
+               round(max(score), 2)                                  AS max_score,
+               date_format(min(span_time), 'yyyy-MM-dd HH:mm')       AS first_seen_utc,
+               date_format(max(detected_at), 'yyyy-MM-dd HH:mm')     AS last_detected_utc
         FROM ${var.catalog}.${var.schema}.genie_detections
         WHERE detector LIKE 'pii_%'
           AND flagged
-          AND detected_at >= current_timestamp() - INTERVAL 1 HOUR
+          AND detected_at >= current_timestamp() - INTERVAL ${var.alert_lookback_hours} HOURS
+        GROUP BY conversation_id
+        ORDER BY is_new DESC, max_score DESC, findings DESC
+      custom_template_format: MARKDOWN
+      custom_summary: "[${bundle.target}] Genie: PII detected in prompts or responses"
+      custom_description: |
+        **@ALERT_NAME** is @ALERT_STATUS. New PII findings since the last run (`is_new` = 1), with
+        every session flagged in the last ${var.alert_lookback_hours} hours below them for context.
+        Entity types and fields only; values are never copied:
+
+        @QUERY_RESULT_TABLE
+
+        **Investigate:** walk each session step by step in
+        [genie_session_timeline](${var.workspace_url}/explore/data/${var.catalog}/${var.schema}/genie_session_timeline):
+
+        `SELECT * FROM ${var.catalog}.${var.schema}.genie_session_timeline WHERE conversation_id = '<conversation_id>' ORDER BY step_number`
+
+        Entity offsets for each finding are in
+        [genie_detections](${var.workspace_url}/explore/data/${var.catalog}/${var.schema}/genie_detections)
+        (`detector LIKE 'pii_%'`). Alert: @ALERT_URL
       evaluation:
         comparison_operator: GREATER_THAN
         source:
-          name: flagged_sessions
-          display: flagged_sessions
+          # No aggregation: the alert reads the first row, and @QUERY_RESULT_TABLE then renders the
+          # raw rows (an aggregation collapses the table to its single value). Rows are sorted
+          # is_new DESC, so first-row is_new > 0 is the same condition as SUM(is_new) > 0.
+          name: is_new
+          display: is_new
         threshold:
           value:
             double_value: 0
+        empty_result_state: OK
         notification:
           notify_on_ok: false
+          retrigger_seconds: 1
           subscriptions:
             - user_email: ${var.alert_email}
       schedule:
-        pause_status: ${var.schedule_pause_status}
+        pause_status: PAUSED # evaluated by the job's alert_pii task
         quartz_cron_schedule: "0 45 * * * ?"
         timezone_id: UTC
 
@@ -32,25 +79,61 @@ resources:
       display_name: "[${bundle.target}] Genie: possible prompt injection or jailbreak"
       warehouse_id: ${var.warehouse_id}
       query_text: |
-        SELECT COUNT(DISTINCT conversation_id) AS flagged_sessions
+        SELECT conversation_id,
+               max(CASE WHEN detected_at >= current_timestamp() - INTERVAL 1 HOUR THEN 1 ELSE 0 END)    AS is_new,
+               any_value(product)                                                                      AS product,
+               any_value(workspace_id)                                                                 AS workspace_id,
+               any_value(requester)                                                                    AS requester,
+               array_join(array_sort(collect_set(replace(detector, 'prompt_injection_', ''))), ', ')    AS detectors,
+               array_join(array_sort(collect_set(details:vector::string)), ', ')                       AS vector,
+               array_join(array_sort(collect_set(span.field)), ', ')                                   AS fields,
+               round(max(score), 3)                                                                    AS max_score,
+               date_format(min(span_time), 'yyyy-MM-dd HH:mm')                                         AS first_seen_utc,
+               date_format(max(detected_at), 'yyyy-MM-dd HH:mm')                                       AS last_detected_utc
         FROM ${var.catalog}.${var.schema}.genie_detections
         WHERE detector LIKE 'prompt_injection_%'
           AND flagged
-          AND detected_at >= current_timestamp() - INTERVAL 1 HOUR
+          AND detected_at >= current_timestamp() - INTERVAL ${var.alert_lookback_hours} HOURS
+        GROUP BY conversation_id
+        ORDER BY is_new DESC, max_score DESC
+      custom_template_format: MARKDOWN
+      custom_summary: "[${bundle.target}] Genie: possible prompt injection or jailbreak"
+      custom_description: |
+        **@ALERT_NAME** is @ALERT_STATUS. New prompt-injection findings since the last run
+        (`is_new` = 1), with every session flagged in the last ${var.alert_lookback_hours} hours below
+        them for context. `direct` = typed by the user, `indirect` = arrived in a tool result or
+        model output:
+
+        @QUERY_RESULT_TABLE
+
+        **Investigate:** walk each session step by step in
+        [genie_session_timeline](${var.workspace_url}/explore/data/${var.catalog}/${var.schema}/genie_session_timeline);
+        the flagged step shows the text that was scored:
+
+        `SELECT * FROM ${var.catalog}.${var.schema}.genie_session_timeline WHERE conversation_id = '<conversation_id>' ORDER BY step_number`
+
+        Scores per detector are in
+        [genie_detections](${var.workspace_url}/explore/data/${var.catalog}/${var.schema}/genie_detections)
+        (`detector LIKE 'prompt_injection_%'`). Alert: @ALERT_URL
       evaluation:
         comparison_operator: GREATER_THAN
         source:
-          name: flagged_sessions
-          display: flagged_sessions
+          # No aggregation: the alert reads the first row, and @QUERY_RESULT_TABLE then renders the
+          # raw rows (an aggregation collapses the table to its single value). Rows are sorted
+          # is_new DESC, so first-row is_new > 0 is the same condition as SUM(is_new) > 0.
+          name: is_new
+          display: is_new
         threshold:
           value:
             double_value: 0
+        empty_result_state: OK
         notification:
           notify_on_ok: false
+          retrigger_seconds: 1
           subscriptions:
             - user_email: ${var.alert_email}
       schedule:
-        pause_status: ${var.schedule_pause_status}
+        pause_status: PAUSED # evaluated by the job's alert_prompt_injection task
         quartz_cron_schedule: "0 45 * * * ?"
         timezone_id: UTC
 
@@ -58,26 +141,59 @@ resources:
       display_name: "[${bundle.target}] Genie: guardrail or boundary-pushing signals"
       warehouse_id: ${var.warehouse_id}
       query_text: |
-        SELECT COUNT(DISTINCT conversation_id) AS flagged_sessions
+        SELECT conversation_id,
+               max(CASE WHEN detected_at >= current_timestamp() - INTERVAL 1 HOUR THEN 1 ELSE 0 END) AS is_new,
+               any_value(product)                                AS product,
+               any_value(workspace_id)                           AS workspace_id,
+               any_value(requester)                              AS requester,
+               array_join(array_sort(collect_set(label)), ', ')  AS rules,
+               count(*)                                          AS hits,
+               round(max(score), 2)                              AS max_severity,
+               date_format(min(span_time), 'yyyy-MM-dd HH:mm')   AS first_seen_utc,
+               date_format(max(detected_at), 'yyyy-MM-dd HH:mm') AS last_detected_utc
         FROM ${var.catalog}.${var.schema}.genie_detections
         WHERE detector = 'guardrail_signal'
           AND flagged
           AND score >= 0.5
-          AND detected_at >= current_timestamp() - INTERVAL 1 HOUR
+          AND detected_at >= current_timestamp() - INTERVAL ${var.alert_lookback_hours} HOURS
+        GROUP BY conversation_id
+        ORDER BY is_new DESC, max_severity DESC, hits DESC
+      custom_template_format: MARKDOWN
+      custom_summary: "[${bundle.target}] Genie: guardrail or boundary-pushing signals"
+      custom_description: |
+        **@ALERT_NAME** is @ALERT_STATUS. New guardrail signals (severity >= 0.5) since the last run
+        (`is_new` = 1), with every session flagged in the last ${var.alert_lookback_hours} hours below
+        them for context:
+
+        @QUERY_RESULT_TABLE
+
+        **Investigate:** walk each session step by step in
+        [genie_session_timeline](${var.workspace_url}/explore/data/${var.catalog}/${var.schema}/genie_session_timeline):
+
+        `SELECT * FROM ${var.catalog}.${var.schema}.genie_session_timeline WHERE conversation_id = '<conversation_id>' ORDER BY step_number`
+
+        The matched wording for each rule is in `details` in
+        [genie_detections](${var.workspace_url}/explore/data/${var.catalog}/${var.schema}/genie_detections)
+        (`detector = 'guardrail_signal'`). Alert: @ALERT_URL
       evaluation:
         comparison_operator: GREATER_THAN
         source:
-          name: flagged_sessions
-          display: flagged_sessions
+          # No aggregation: the alert reads the first row, and @QUERY_RESULT_TABLE then renders the
+          # raw rows (an aggregation collapses the table to its single value). Rows are sorted
+          # is_new DESC, so first-row is_new > 0 is the same condition as SUM(is_new) > 0.
+          name: is_new
+          display: is_new
         threshold:
           value:
             double_value: 0
+        empty_result_state: OK
         notification:
           notify_on_ok: false
+          retrigger_seconds: 1
           subscriptions:
             - user_email: ${var.alert_email}
       schedule:
-        pause_status: ${var.schedule_pause_status}
+        pause_status: PAUSED # evaluated by the job's alert_guardrail_signals task
         quartz_cron_schedule: "0 45 * * * ?"
         timezone_id: UTC
 
@@ -85,24 +201,57 @@ resources:
       display_name: "[${bundle.target}] Genie: high-risk sessions (risk_score >= 0.8)"
       warehouse_id: ${var.warehouse_id}
       query_text: |
-        SELECT COUNT(*) AS high_risk_sessions
+        SELECT conversation_id,
+               CASE WHEN flags.last_flagged_at >= current_timestamp() - INTERVAL 1 HOUR THEN 1 ELSE 0 END AS is_new,
+               product,
+               workspace_id,
+               requester,
+               round(risk_score, 2)                                    AS risk_score,
+               array_join(flags.flag_detectors, ', ')                  AS detectors,
+               array_join(flags.flag_labels, ', ')                     AS labels,
+               activity.turn_count                                     AS turns,
+               date_format(flags.first_flagged_at, 'yyyy-MM-dd HH:mm') AS first_flagged_utc,
+               date_format(flags.last_flagged_at, 'yyyy-MM-dd HH:mm')  AS last_flagged_utc
         FROM ${var.catalog}.${var.schema}.genie_sessions
         WHERE is_flagged
           AND risk_score >= 0.8
-          AND flags.last_flagged_at >= current_timestamp() - INTERVAL 1 HOUR
+          AND flags.last_flagged_at >= current_timestamp() - INTERVAL ${var.alert_lookback_hours} HOURS
+        ORDER BY is_new DESC, risk_score DESC
+      custom_template_format: MARKDOWN
+      custom_summary: "[${bundle.target}] Genie: high-risk sessions (risk_score >= 0.8)"
+      custom_description: |
+        **@ALERT_NAME** is @ALERT_STATUS. Sessions at risk_score >= 0.8 with a new finding since the
+        last run (`is_new` = 1), with every high-risk session from the last
+        ${var.alert_lookback_hours} hours below them for context:
+
+        @QUERY_RESULT_TABLE
+
+        **Investigate:** start from the session row in
+        [genie_sessions](${var.workspace_url}/explore/data/${var.catalog}/${var.schema}/genie_sessions)
+        (`risk` struct shows what drove the score), then walk it step by step in
+        [genie_session_timeline](${var.workspace_url}/explore/data/${var.catalog}/${var.schema}/genie_session_timeline):
+
+        `SELECT * FROM ${var.catalog}.${var.schema}.genie_session_timeline WHERE conversation_id = '<conversation_id>' ORDER BY step_number`
+
+        Alert: @ALERT_URL
       evaluation:
         comparison_operator: GREATER_THAN
         source:
-          name: high_risk_sessions
-          display: high_risk_sessions
+          # No aggregation: the alert reads the first row, and @QUERY_RESULT_TABLE then renders the
+          # raw rows (an aggregation collapses the table to its single value). Rows are sorted
+          # is_new DESC, so first-row is_new > 0 is the same condition as SUM(is_new) > 0.
+          name: is_new
+          display: is_new
         threshold:
           value:
             double_value: 0
+        empty_result_state: OK
         notification:
           notify_on_ok: false
+          retrigger_seconds: 1
           subscriptions:
             - user_email: ${var.alert_email}
       schedule:
-        pause_status: ${var.schedule_pause_status}
+        pause_status: PAUSED # evaluated by the job's alert_high_risk_sessions task
         quartz_cron_schedule: "0 50 * * * ?"
         timezone_id: UTC

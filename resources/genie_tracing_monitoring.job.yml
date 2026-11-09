@@ -4,8 +4,8 @@ resources:
       name: "[${bundle.target}] genie_tracing_monitoring"
       description: >
         Flattens Genie One / Genie Code traces, runs PII, prompt-injection and guardrail-signal
-        detections, then rebuilds the session rollups. Alerts run on their own schedule and read
-        the tables this job maintains.
+        detections, rebuilds the session rollups, then evaluates the four SQL alerts against the
+        finished tables.
 
       schedule:
         quartz_cron_expression: "0 15 * * * ?" # hourly at :15
@@ -67,10 +67,46 @@ resources:
           notebook_task:
             notebook_path: ../src/notebooks/04_detect_guardrail_signals.py
 
+        # ALL_DONE: one failed detector (e.g. a missing spaCy wheel) must not stop the session
+        # rollup or the alerts for what the other detectors found.
         - task_key: sessions_pipeline
           depends_on:
             - task_key: detect_pii
             - task_key: detect_prompt_injection
             - task_key: detect_guardrail_signals
+          run_if: ALL_DONE
           pipeline_task:
             pipeline_id: ${resources.pipelines.genie_tracing_sessions.id}
+
+        # Alerts run last so genie_sessions is fully rebuilt before high-risk sessions are checked.
+        # Notifications go to each alert's own subscribers (no task-level subscribers set).
+        - task_key: alert_pii
+          depends_on:
+            - task_key: sessions_pipeline
+          run_if: ALL_DONE
+          alert_task:
+            alert_id: ${resources.alerts.genie_pii_detected.id}
+            warehouse_id: ${var.warehouse_id}
+
+        - task_key: alert_prompt_injection
+          depends_on:
+            - task_key: sessions_pipeline
+          run_if: ALL_DONE
+          alert_task:
+            alert_id: ${resources.alerts.genie_prompt_injection_detected.id}
+            warehouse_id: ${var.warehouse_id}
+
+        - task_key: alert_guardrail_signals
+          depends_on:
+            - task_key: sessions_pipeline
+          run_if: ALL_DONE
+          alert_task:
+            alert_id: ${resources.alerts.genie_guardrail_signals.id}
+            warehouse_id: ${var.warehouse_id}
+
+        - task_key: alert_high_risk_sessions
+          depends_on:
+            - task_key: sessions_pipeline
+          alert_task:
+            alert_id: ${resources.alerts.genie_high_risk_sessions.id}
+            warehouse_id: ${var.warehouse_id}

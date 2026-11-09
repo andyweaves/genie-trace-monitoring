@@ -58,7 +58,7 @@ flowchart TD
     inj["03_detect_prompt_injection<br/><i>ai_query → Prompt Guard 2<br/>+ ai_classify second opinion</i>"]
     gr["04_detect_guardrail_signals<br/><i>rules over outcomes and text</i>"]
     sess["pipeline task<br/>genie_tracing_sessions<br/><i>refresh genie_sessions, timeline</i>"]
-    al["SQL alerts<br/><i>own hourly schedule, read the tables</i>"]
+    al["alert tasks (4)<br/><i>evaluate the SQL alerts<br/>on the finished tables</i>"]
 
     etl --> pii
     etl --> inj
@@ -66,7 +66,7 @@ flowchart TD
     pii --> sess
     inj --> sess
     gr --> sess
-    sess -.-> al
+    sess --> al
 
     classDef pipe fill:#f5f7fa,stroke:#1b3139,color:#1b3139
     classDef nb fill:#fff4e5,stroke:#b86e00,color:#1b3139
@@ -128,8 +128,8 @@ processing (`CREATE OR REFRESH STREAMING TABLE ... FROM STREAM(...)`).
 | Schema + volume | `resources/genie_tracing.schema.yml` | Target schema and wheel volume |
 | Pipeline `genie_tracing_etl` | `src/pipelines/etl/` | `genie_turns`, `genie_tool_calls` |
 | Pipeline `genie_tracing_sessions` | `src/pipelines/sessions/` | `genie_sessions`, `genie_session_timeline` |
-| Job `genie_tracing_monitoring` | `resources/genie_tracing_monitoring.job.yml` | ETL → 3 detection notebooks → sessions. Hourly, paused by default. |
-| SQL alerts (4) | `resources/genie_tracing_alerts.alert.yml` | PII, prompt injection, guardrail signals, high-risk sessions. Hourly, paused by default. |
+| Job `genie_tracing_monitoring` | `resources/genie_tracing_monitoring.job.yml` | ETL → 3 detection notebooks → sessions → 4 alert tasks. Hourly, paused by default. |
+| SQL alerts (4) | `resources/genie_tracing_alerts.alert.yml` | PII, prompt injection, guardrail signals, high-risk sessions. Evaluated by the job's alert tasks (their own schedules stay paused). Trigger only on sessions with a new finding since the previous run; the notification lists those first, then every session flagged in the last `alert_lookback_hours` for context (ids, labels, scores; never prompt text), with links to the tables to investigate. |
 
 ### Notebooks (`src/notebooks/`, Python source format)
 
@@ -189,8 +189,11 @@ databricks bundle run genie_tracing_monitoring -t dev
 
 Then open `src/notebooks/06_table_guide` in the workspace and walk through the tables.
 
-The job and alerts deploy **paused**. Unpause them when you are happy with the output
-(`schedule_pause_status: UNPAUSED`, or in the UI). The `prod` target unpauses them for you.
+The job deploys **paused**. Unpause it when you are happy with the output
+(`schedule_pause_status: UNPAUSED`, or in the UI). The `prod` target unpauses it for you. The
+alerts need no unpausing: the job evaluates them as its last step, once `genie_sessions` is rebuilt,
+so a high-risk session is never checked against a half-refreshed table. A failed detector does not
+stop the session rollup or the other alerts.
 
 Variables you will most likely override (in `databricks.local.yml` or with `--var`):
 
@@ -203,6 +206,8 @@ Variables you will most likely override (in `databricks.local.yml` or with `--va
 | `prompt_guard_endpoint` | `genie-prompt-guard-2` | Endpoint created by `01_deploy_prompt_guard` |
 | `detection_lookback_days` | `7` | How far back each run re-evaluates |
 | `alert_email` | deployer | Who gets alert notifications |
+| `alert_lookback_hours` | `24` | Hours of flagged sessions listed in each alert notification (alerts still only trigger on new findings) |
+| `workspace_url` | `workspace.host` | Base URL for table links in alert notifications. Set it when the host comes only from `--profile` (it is empty then) |
 
 ## Detections
 

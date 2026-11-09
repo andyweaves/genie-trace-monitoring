@@ -59,6 +59,19 @@ variables:
     description: Email address that receives alert notifications.
     default: ${workspace.current_user.userName}
 
+  alert_lookback_hours:
+    description: >
+      How many hours of flagged sessions each alert notification lists. Alerts only trigger when a
+      session got a new finding since the previous (hourly) job run; older rows are context.
+    default: "24"
+
+  workspace_url:
+    description: >
+      Base URL of the workspace (https://...), used for the table links in alert notifications.
+      Defaults to workspace.host, which is empty when the host comes only from a CLI profile; set it
+      in databricks.local.yml or with --var in that case.
+    default: ${workspace.host}
+
 # Targets deliberately carry no workspace host or profile: pass `--profile <name>` on the CLI,
 # or add a gitignored databricks.local.yml (see databricks.local.yml.example).
 targets:

@@ -7,5 +7,6 @@ targets:
       host: https://my-workspace.cloud.databricks.com
     variables:
       warehouse_name: My SQL Warehouse     # existing SQL warehouse for the alerts
+      workspace_url: https://my-workspace.cloud.databricks.com   # for links in alert notifications
       # catalog: unity_gateway
       # source_table: unity_gateway.unified_tracing.unity_gateway_otel_spans
