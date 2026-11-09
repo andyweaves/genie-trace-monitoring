@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1060 420" width="100%" style="max-width:1060px;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 420" width="100%" style="max-width:1320px;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#5c6b73"/>
@@ -11,13 +11,14 @@
       .det   { fill:#fff4e5; stroke:#b86e00; }
       .gold  { fill:#e8f3ec; stroke:#1f7a4d; }
       .view  { fill:#ffffff; stroke:#1f7a4d; stroke-dasharray:4 3; }
+      .alert { fill:#fdecec; stroke:#b42318; }
       .name  { font-family:SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; font-weight:700; fill:#1b3139; }
       .desc  { font-size:11px; fill:#3b4a52; }
       .edge  { fill:none; stroke:#5c6b73; stroke-width:1.5; marker-end:url(#arrow); }
       .lbl   { font-size:10.5px; fill:#5c6b73; }
     </style>
   </defs>
-  <rect width="1060" height="420" fill="#ffffff"/>
+  <rect width="1320" height="420" fill="#ffffff"/>
 
   <!-- column headers -->
   <text x="130" y="26" text-anchor="middle" class="col">1 · Source</text>
@@ -28,6 +29,8 @@
   <text x="660" y="42" text-anchor="middle" class="sub">job tasks 02 PII · 03 injection · 04 guardrails</text>
   <text x="920" y="26" text-anchor="middle" class="col">4 · Roll up</text>
   <text x="920" y="42" text-anchor="middle" class="sub">pipeline genie_tracing_sessions</text>
+  <text x="1180" y="26" text-anchor="middle" class="col">5 · Alert</text>
+  <text x="1180" y="42" text-anchor="middle" class="sub">job task, after the roll up</text>
 
   <!-- column 1 -->
   <rect x="30" y="70" width="200" height="90" class="box src"/>
@@ -56,19 +59,26 @@
   <text x="660" y="145" text-anchor="middle" class="name">genie_detections</text>
   <text x="660" y="165" text-anchor="middle" class="desc">1 row per span × detector × field</text>
   <text x="660" y="181" text-anchor="middle" class="desc">flagged · score · label · evidence</text>
-  <text x="660" y="197" text-anchor="middle" class="desc">Presidio · Prompt Guard · rules</text>
+  <text x="660" y="197" text-anchor="middle" class="desc">Presidio + DOB · Prompt Guard · rules</text>
 
   <!-- column 4 -->
   <rect x="820" y="120" width="200" height="90" class="box gold"/>
   <text x="920" y="145" text-anchor="middle" class="name">genie_sessions</text>
-  <text x="920" y="165" text-anchor="middle" class="desc">1 row per conversation</text>
-  <text x="920" y="181" text-anchor="middle" class="desc">rollups · has_pii · has_injection</text>
-  <text x="920" y="197" text-anchor="middle" class="desc">has_guardrail_signal · risk_score</text>
+  <text x="920" y="165" text-anchor="middle" class="desc">1 row per conversation · rollups</text>
+  <text x="920" y="181" text-anchor="middle" class="desc">has_pii · injection · guardrail flags</text>
+  <text x="920" y="197" text-anchor="middle" class="desc">severity · risk_score</text>
 
   <rect x="820" y="270" width="200" height="70" class="box view"/>
   <text x="920" y="295" text-anchor="middle" class="name">genie_session_timeline</text>
   <text x="920" y="315" text-anchor="middle" class="desc">view · 1 row per step, in order</text>
   <text x="920" y="330" text-anchor="middle" class="desc">turns + tool calls + flags</text>
+
+  <!-- column 5 -->
+  <rect x="1080" y="120" width="200" height="90" class="box alert"/>
+  <text x="1180" y="145" text-anchor="middle" class="name">sessions to review</text>
+  <text x="1180" y="165" text-anchor="middle" class="desc">SQL alert · fires on new findings</text>
+  <text x="1180" y="181" text-anchor="middle" class="desc">new sessions first, then by risk</text>
+  <text x="1180" y="197" text-anchor="middle" class="desc">plus the last 24 h for context</text>
 
   <!-- edges: source -> flatten -->
   <path d="M230,105 L300,105" class="edge"/>
@@ -80,6 +90,9 @@
 
   <!-- edges: detect -> roll up -->
   <path d="M760,165 L820,165" class="edge"/>
+
+  <!-- edge: roll up -> alert -->
+  <path d="M1020,165 L1080,165" class="edge"/>
 
   <!-- edges: flatten -> sessions (around detections) -->
   <path d="M500,85 L790,85 C805,85 805,150 820,150" class="edge"/>
@@ -101,4 +114,6 @@
   <text x="480" y="401" class="lbl">Delta table, MERGEd by detectors</text>
   <rect x="720" y="392" width="14" height="10" class="box gold"/>
   <text x="740" y="401" class="lbl">triage entry point (start here)</text>
+  <rect x="980" y="392" width="14" height="10" class="box alert"/>
+  <text x="1000" y="401" class="lbl">SQL alert, evaluated by the job</text>
 </svg>

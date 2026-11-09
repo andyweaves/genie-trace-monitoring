@@ -3,10 +3,10 @@
 A trust-but-monitor accelerator for Databricks **Genie One** and **Genie Code**, built on the
 Unity Gateway unified trace table. It flattens every Genie turn and tool call into queryable
 tables, runs PII, prompt-injection and guardrail-signal detections over them, rolls the results
-up per session, and alerts when something is flagged.
+up per session with a severity, and sends one alert listing the sessions worth reviewing.
 
 Everything is a [Databricks Asset Bundle](https://docs.databricks.com/dev-tools/bundles/):
-two serverless Lakeflow pipelines, one job, four SQL alerts, seven notebooks, deployable to any
+two serverless Lakeflow pipelines, one job, one SQL alert, seven notebooks, deployable to any
 workspace with a single `databricks bundle deploy`.
 
 ## Contents
@@ -28,7 +28,7 @@ Customers adopting Genie raise three concerns that the product does not answer o
 
 | Concern | What Genie does today | What this accelerator adds |
 |---|---|---|
-| Users paste PII into prompts and it reaches the LLM | No redaction before the model call. Zero-retention agreements with model partners. | Row-level PII detection on prompts, responses, tool arguments and tool results; governed `class.*` tags on the columns; per-session `has_pii` flag. |
+| Users paste PII into prompts and it reaches the LLM | No redaction before the model call. Zero-retention agreements with model partners. | Row-level PII detection on prompts, responses, tool arguments and tool results; governed `class.*` tags on the columns; per-session `has_pii` flag and a severity weighted by entity type (a card number outranks a name). |
 | How strong are the guardrails and safety classifiers | Genie Code: deterministic hard-blocks, AI safety inspection, human approval or an intent-based Auto-approve classifier. Genie One: scope-based Auto-approve for tool actions, otherwise architectural controls plus a system-prompt topic check. | Transparent rules over the *outcomes* the trace does record (refusals, rejected or denied tool calls, approval requests, destructive tool arguments, refusal text) with a per-session `risk_score`. |
 | Does Auto-approve open the door to prompt injection | The approval classifier excludes retrieved content from its context, but nothing surfaces attempts to an admin. | Llama Prompt Guard 2 via `ai_query` over prompts (direct) and tool results (indirect), with an `ai_classify` second opinion. |
 
@@ -38,18 +38,21 @@ Customers adopting Genie raise three concerns that the product does not answer o
 
 ![How the tables fit together](src/notebooks/images/table_guide_architecture.png)
 
-Four stages, left to right: the raw Unity Gateway spans are flattened into turns and tool calls,
-the detectors scan every free-text field and write one row per finding, and the session rollup
-joins it all back together per conversation. Dashed boxes are sources the bundle does not own;
-the orange table is the only one written by notebooks rather than a pipeline; green is where
-triage starts. Source SVG: `docs/table_guide_architecture.svg`, rendered by
+Five stages, left to right: the raw Unity Gateway spans are flattened into turns and tool calls,
+the detectors scan every free-text field and write one row per finding, the session rollup joins
+it all back together per conversation with a `risk_score` and `severity`, and the "sessions to
+review" alert reports sessions with new findings. Dashed boxes are sources the bundle does not
+own; the orange table is the only one written by notebooks rather than a pipeline; green is where
+triage starts; red is the alert. Source SVG: `docs/table_guide_architecture.svg`, rendered by
 `docs/render_diagram.sh`.
 
 ### What runs when
 
 The hourly job `genie_tracing_monitoring` drives everything. The three detectors run in parallel
 and each only scans text it has not seen before; the guardrail rules re-score their whole lookback
-window so pattern changes update history.
+window so pattern changes update history, and the PII step re-weights existing findings. The
+sessions rollup runs even if a detector failed, and the alert is evaluated last, against the
+finished tables.
 
 ```mermaid
 flowchart TD
@@ -58,7 +61,7 @@ flowchart TD
     inj["03_detect_prompt_injection<br/><i>ai_query → Prompt Guard 2<br/>+ ai_classify second opinion</i>"]
     gr["04_detect_guardrail_signals<br/><i>rules over outcomes and text</i>"]
     sess["pipeline task<br/>genie_tracing_sessions<br/><i>refresh genie_sessions, timeline</i>"]
-    al["alert tasks (4)<br/><i>evaluate the SQL alerts<br/>on the finished tables</i>"]
+    al["alert task<br/><i>sessions to review,<br/>on the finished tables</i>"]
 
     etl --> pii
     etl --> inj
@@ -81,13 +84,13 @@ flowchart TD
 ```mermaid
 flowchart LR
     text["Text field on a span<br/><i>prompt · response · tool_arguments<br/>tool_result · model_output</i>"]
-    p["Presidio<br/><i>entities, offsets</i>"]
+    p["Presidio + DOB recogniser<br/><i>entities, offsets,<br/>weighted by entity type</i>"]
     g["Prompt Guard 2<br/><i>malicious probability</i>"]
     c["ai_classify<br/><i>LLM judge</i>"]
     r["Guardrail rules<br/><i>Action denied:, I dropped …,<br/>USER_REJECTED, …</i>"]
     d["genie_detections<br/><i>detector · flagged · score · label · evidence</i>"]
-    s["genie_sessions<br/><i>flags.has_pii / has_prompt_injection /<br/>has_guardrail_signal · risk_score</i>"]
-    a["Alert"]
+    s["genie_sessions<br/><i>flags.has_pii / has_prompt_injection /<br/>has_guardrail_signal · risk_score · severity</i>"]
+    a["Alert: sessions to review<br/><i>new findings only,<br/>24 h of context</i>"]
 
     text --> p & g & c & r --> d --> s --> a
 
@@ -106,7 +109,7 @@ flowchart LR
 ├── genie_turns              MV     one row per turn (root span): when/who, keys, prompt, response + outcome / context / span / completeness / links structs
 ├── genie_tool_calls         MV     one row per tool call / approval / question / model call: when/who, keys, tool, arguments, result + outcome / span structs
 ├── genie_detections         table  one row per (span, detector, field): when/who, detector, flagged, score, label + span struct, evidence
-├── genie_sessions           MV     one row per conversation: when/who, is_flagged, risk_score + activity / flags / risk / feedback / context structs
+├── genie_sessions           MV     one row per conversation: when/who, is_flagged, risk_score, severity + activity / flags / risk / feedback / context structs
 ├── genie_session_timeline   view   ordered step-by-step walkthrough: when/who, position, event, text, is_flagged + outcome / detections / span structs
 └── genie_tracing_libs       volume wheels for Presidio's spaCy model
 ```
@@ -128,8 +131,8 @@ processing (`CREATE OR REFRESH STREAMING TABLE ... FROM STREAM(...)`).
 | Schema + volume | `resources/genie_tracing.schema.yml` | Target schema and wheel volume |
 | Pipeline `genie_tracing_etl` | `src/pipelines/etl/` | `genie_turns`, `genie_tool_calls` |
 | Pipeline `genie_tracing_sessions` | `src/pipelines/sessions/` | `genie_sessions`, `genie_session_timeline` |
-| Job `genie_tracing_monitoring` | `resources/genie_tracing_monitoring.job.yml` | ETL → 3 detection notebooks → sessions → 4 alert tasks. Hourly, paused by default. |
-| SQL alerts (4) | `resources/genie_tracing_alerts.alert.yml` | PII, prompt injection, guardrail signals, high-risk sessions. Evaluated by the job's alert tasks (their own schedules stay paused). Trigger only on sessions with a new finding since the previous run; the notification lists those first, then every session flagged in the last `alert_lookback_hours` for context (ids, labels, scores; never prompt text), with links to the tables to investigate. |
+| Job `genie_tracing_monitoring` | `resources/genie_tracing_monitoring.job.yml` | ETL → 3 detection notebooks → sessions → alert task. Hourly, paused by default. |
+| SQL alert "sessions to review" | `resources/genie_tracing_alerts.alert.yml` | One digest across PII, prompt injection and guardrail signals: per session `severity`, `risk_score` and the top score per category. Evaluated by the job's alert task (its own schedule stays paused). Triggers only on sessions with a new finding since the previous run; the notification lists those first, then every session flagged in the last `alert_lookback_hours` for context (ids, labels, scores; never prompt text), with links to the tables to investigate. |
 
 ### Notebooks (`src/notebooks/`, Python source format)
 
@@ -137,7 +140,7 @@ processing (`CREATE OR REFRESH STREAMING TABLE ... FROM STREAM(...)`).
 |---|---|
 | `00_setup.py` | Source table check, schema / volume / detections table, stage spaCy wheel, Data Classification status, preview checklist |
 | `01_deploy_prompt_guard.py` | Get Llama Prompt Guard 2 weights (from Hugging Face, or copied out of a Prompt Guard model already registered in UC), log a batch-scoring pyfunc with 512-token chunking, deploy endpoint `genie-prompt-guard-2` |
-| `02_detect_pii.py` | Presidio pandas UDF (row-level), optional `ai_extract` comparison, Data Classification results, apply governed `class.*` tags |
+| `02_detect_pii.py` | Presidio pandas UDF (row-level) with a context-gated `DATE_OF_BIRTH` recogniser, severity weighting by entity type (re-applied to history every run), optional `ai_extract` comparison, Data Classification results, apply governed `class.*` tags |
 | `03_detect_prompt_injection.py` | `ai_query` to Prompt Guard over prompts and tool results, `ai_classify` second opinion, disagreement review |
 | `04_detect_guardrail_signals.py` | Rule-based signals over outcomes and text; query to discover the guardrail's own wording |
 | `05_session_explorer.py` | Adoption, flagged sessions, session walkthrough, approval flows, tool usage, thumbs-down |
@@ -156,7 +159,8 @@ responses, SQL and tool results**, readable by anyone with `SELECT`.
    unified trace table set up by a metastore admin, and the **Genie One Tracing** / **Genie Code
    Tracing** previews on in each workspace you want to monitor. Nothing is backfilled.
 2. `SELECT` on the unified trace table and `CREATE` on the target catalog.
-3. An existing SQL warehouse for the alerts (set `warehouse_name`).
+3. An existing **serverless or pro** SQL warehouse for the alert (set `warehouse_name`); job alert
+   tasks do not run on classic warehouses.
 4. For `01_deploy_prompt_guard`, either a Prompt Guard 2 model already registered in Unity
    Catalog (`model_source = uc_model`, no token needed) or a Databricks secret holding a Hugging
    Face token with access to Meta Llama models (`model_source = huggingface`, default scope
@@ -175,7 +179,7 @@ git clone https://github.com/andyweaves/genie-trace-monitoring
 cd genie-trace-monitoring
 
 # Point the bundle at your workspace. Either pass --profile on every command, or:
-cp databricks.local.yml.example databricks.local.yml   # gitignored; set profile, host, warehouse_name
+cp databricks.local.yml.example databricks.local.yml   # gitignored; set profile, host, warehouse_name, workspace_url
 
 databricks bundle validate -t dev
 databricks bundle deploy   -t dev
@@ -191,9 +195,9 @@ Then open `src/notebooks/06_table_guide` in the workspace and walk through the t
 
 The job deploys **paused**. Unpause it when you are happy with the output
 (`schedule_pause_status: UNPAUSED`, or in the UI). The `prod` target unpauses it for you. The
-alerts need no unpausing: the job evaluates them as its last step, once `genie_sessions` is rebuilt,
-so a high-risk session is never checked against a half-refreshed table. A failed detector does not
-stop the session rollup or the other alerts.
+alert needs no unpausing: the job evaluates it as its last step, once `genie_sessions` is rebuilt,
+so a session is never checked against a half-refreshed table. A failed detector does not stop the
+session rollup or the alert for what the other detectors found.
 
 Variables you will most likely override (in `databricks.local.yml` or with `--var`):
 
@@ -202,19 +206,19 @@ Variables you will most likely override (in `databricks.local.yml` or with `--va
 | `catalog` / `schema` | `unity_gateway` / `genie_tracing` | Where the derived tables live |
 | `source_table` | `unity_gateway.unified_tracing.unity_gateway_otel_spans` | Your unified trace table |
 | `annotations_table` | `..._otel_annotations` | Its feedback sibling |
-| `warehouse_name` | `Serverless Starter Warehouse` | SQL warehouse for alerts |
+| `warehouse_name` | `Serverless Starter Warehouse` | Serverless or pro SQL warehouse for the alert |
 | `prompt_guard_endpoint` | `genie-prompt-guard-2` | Endpoint created by `01_deploy_prompt_guard` |
 | `detection_lookback_days` | `7` | How far back each run re-evaluates |
 | `alert_email` | deployer | Who gets alert notifications |
-| `alert_lookback_hours` | `24` | Hours of flagged sessions listed in each alert notification (alerts still only trigger on new findings) |
+| `alert_lookback_hours` | `24` | Hours of flagged sessions listed in each alert notification (the alert still only triggers on new findings) |
 | `workspace_url` | `workspace.host` | Base URL for table links in alert notifications. Set it when the host comes only from `--profile` (it is empty then) |
 
 ## Detections
 
 | Detector | Notebook | How | Writes |
 |---|---|---|---|
-| `pii_presidio` | 02 | Microsoft Presidio in a pandas UDF: regex / checksum recognisers everywhere, spaCy NER only on prompt and response, with product-term and identifier filters | entity type, score, offsets (never the value) |
-| `pii_ai_extract` | 02, opt-in | `ai_extract` on a sample, for comparison | entity types found |
+| `pii_presidio` | 02 | Microsoft Presidio in a pandas UDF: regex / checksum recognisers everywhere, spaCy NER only on prompt and response, with product-term and identifier filters, plus a context-gated `DATE_OF_BIRTH` recogniser | most severe entity type, confidence × severity weight, offsets (never the value) |
+| `pii_ai_extract` | 02, opt-in | `ai_extract` on a sample, for comparison | entity types found, mapped to Presidio types and weighted the same way |
 | `prompt_injection_prompt_guard` | 03 | `ai_query` to a Llama Prompt Guard 2 endpoint; 512-token chunking with max pooling; prompts = direct vector, tool results and model output = indirect | malicious probability |
 | `prompt_injection_ai_classify` | 03 | `ai_classify` three-way judge on Prompt Guard hits plus a random sample | legitimate / destructive-or-boundary-pushing / injection |
 | `guardrail_signal` | 04 | Transparent rules over outcomes and response text | one row per rule hit, severity-weighted |
@@ -226,15 +230,34 @@ Guardrail rules, highest severity first: `guardrail_intervention` (classifier pr
 `external_destination`, plus informational `approval_requested`, `turn_error` and `tool_error`
 (recorded in `genie_detections`, but they do not flag the session or add to `risk_score`).
 
-Session `risk_score` = min(1, 0.4·PII + 0.8·injection + guardrail severity + 0.2 if a tool call
-was rejected). Weights live in `src/pipelines/sessions/transformations/genie_sessions.sql`.
+PII findings are weighted by entity type (`pii_weights` on `02_detect_pii`): a finding's `score` is
+Presidio's confidence × the type's weight, and its `label` is the most severe entity.
+
+| Weight | Entity types |
+|---|---|
+| 1.0 | `CREDIT_CARD`, `US_SSN`, `US_BANK_NUMBER`, `IBAN_CODE`, `US_ITIN`, `CRYPTO` |
+| 0.9 | `US_PASSPORT`, `US_DRIVER_LICENSE`, `UK_NHS` |
+| 0.6 | `DATE_OF_BIRTH` |
+| 0.5 | `PHONE_NUMBER`, `EMAIL_ADDRESS`, anything not listed (`pii_default_weight`) |
+| 0.3 | `PERSON`, `LOCATION`, `MEDICAL_LICENSE` |
+| 0.2 | `IP_ADDRESS` |
+
+Session `risk_score` = min(1, PII + 0.8·injection + guardrail severity + 0.2 if a tool call was
+rejected + 0.2 if a name appears with a date of birth, phone number or location). `severity` is
+**high** at ≥ 0.8, **medium** at ≥ 0.5, otherwise **low** (`none` when not flagged). A name alone
+scores about 0.26 (low), a name with a date of birth about 0.7 (medium), a card number 1.0 (high).
+Weights live in `src/pipelines/sessions/transformations/genie_sessions.sql`.
 
 ## Tuning
 
 * **Presidio**: `pii_threshold`, `ignore_entities` (default ignores `ORGANIZATION`, `DATE_TIME`,
   `URL`, `NRP`, `UUID`) and `allowlist_terms` on `02_detect_pii`. The requester's own email is never
   counted. NER entities are only accepted in prose fields, `PERSON` needs two words, `LOCATION`
-  needs three letters and mixed case.
+  needs three letters and mixed case. A date counts as `DATE_OF_BIRTH` only with birth wording
+  (`DOB`, `date of birth`, `born`, `birthday`, ...) right next to it, a year at least 10 years ago,
+  and outside tool arguments (where `WHERE dob > '1990-01-01'` is a filter, not a birth date).
+* **PII severity**: `pii_weights` (JSON) and `pii_default_weight` on `02_detect_pii`. Every run
+  re-weights existing findings too, without re-triggering the alert.
 * **Prompt Guard**: `prompt_guard_threshold` on `03_detect_prompt_injection` (default 0.85). The
   22M model catches direct jailbreak phrasing reliably but scored a table-embedded
   "SYSTEM: … DROP TABLE" row as benign in testing. Keep the `ai_classify` second opinion on, or
@@ -244,8 +267,8 @@ was rejected). Weights live in `src/pipelines/sessions/transformations/genie_ses
   last cell of that notebook lists recent non-success turns to mine for it.
 * **Scan scope**: a model-call output identical to the turn's final response is scanned once, as
   the response. Guardrail rules re-score their lookback window on every run in a single MERGE:
-  hits that no longer match are deleted, unchanged hits keep their original `detected_at`, so
-  alerts fire once per finding rather than every hour.
+  hits that no longer match are deleted, unchanged hits keep their original `detected_at`, so the
+  alert only counts a hit as new once rather than every hour.
 * **Failed scans**: rows where Presidio, Prompt Guard or `ai_classify` errored are not written,
   so they are retried on the next run while still inside the lookback window.
 * **Diagram**: `src/notebooks/images/table_guide_architecture.png` (used above and in
@@ -304,7 +327,7 @@ Verified against live traces in November 2026. These shape what the detectors ca
 │   ├── genie_tracing_etl.pipeline.yml
 │   ├── genie_tracing_sessions.pipeline.yml
 │   ├── genie_tracing_monitoring.job.yml
-│   └── genie_tracing_alerts.alert.yml
+│   └── genie_tracing_alerts.alert.yml "sessions to review" alert
 ├── src/
 │   ├── pipelines/etl/transformations/        genie_turns.sql, genie_tool_calls.sql
 │   ├── pipelines/sessions/transformations/   genie_sessions.sql, genie_session_timeline.sql

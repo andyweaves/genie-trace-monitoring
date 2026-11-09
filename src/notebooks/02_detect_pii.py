@@ -29,6 +29,19 @@
 
 # COMMAND ----------
 
+import json
+
+# Severity weight per entity type: a finding's score = Presidio confidence x weight, so a card number
+# in cleartext outranks a name. Unlisted types use PII_DEFAULT_WEIGHT.
+DEFAULT_PII_WEIGHTS = {
+    "CREDIT_CARD": 1.0, "US_SSN": 1.0, "US_BANK_NUMBER": 1.0, "IBAN_CODE": 1.0, "US_ITIN": 1.0, "CRYPTO": 1.0,
+    "US_PASSPORT": 0.9, "US_DRIVER_LICENSE": 0.9, "UK_NHS": 0.9,
+    "DATE_OF_BIRTH": 0.6,
+    "PHONE_NUMBER": 0.5, "EMAIL_ADDRESS": 0.5,
+    "PERSON": 0.3, "LOCATION": 0.3, "MEDICAL_LICENSE": 0.3,
+    "IP_ADDRESS": 0.2,
+}
+
 dbutils.widgets.text("spacy_model", "en_core_web_md", "spaCy model")
 dbutils.widgets.text("pii_threshold", "0.5", "Presidio score threshold")
 dbutils.widgets.text("ignore_entities", "DATE_TIME,URL,NRP,ORGANIZATION,UUID", "Presidio entity types to ignore")
@@ -36,6 +49,8 @@ dbutils.widgets.text("allowlist_terms", "Delta,Databricks,Unity Catalog,Spark,La
 dbutils.widgets.dropdown("run_ai_extract", "false", ["false", "true"], "Run ai_extract comparison")
 dbutils.widgets.text("ai_extract_sample", "25", "ai_extract sample rows")
 dbutils.widgets.dropdown("apply_governed_tags", "true", ["false", "true"], "Apply class.* tags to columns")
+dbutils.widgets.text("pii_weights", json.dumps(DEFAULT_PII_WEIGHTS), "Severity weight per entity type (JSON)")
+dbutils.widgets.text("pii_default_weight", "0.5", "Weight for entity types not listed")
 
 SPACY_MODEL = dbutils.widgets.get("spacy_model")
 PII_THRESHOLD = float(dbutils.widgets.get("pii_threshold"))
@@ -44,6 +59,8 @@ ALLOWLIST_TERMS = [t.strip().lower() for t in dbutils.widgets.get("allowlist_ter
 RUN_AI_EXTRACT = dbutils.widgets.get("run_ai_extract") == "true"
 AI_EXTRACT_SAMPLE = int(dbutils.widgets.get("ai_extract_sample"))
 APPLY_GOVERNED_TAGS = dbutils.widgets.get("apply_governed_tags") == "true"
+PII_WEIGHTS = {k: float(v) for k, v in json.loads(dbutils.widgets.get("pii_weights")).items()}
+PII_DEFAULT_WEIGHT = float(dbutils.widgets.get("pii_default_weight"))
 
 # COMMAND ----------
 
@@ -60,6 +77,16 @@ APPLY_GOVERNED_TAGS = dbutils.widgets.get("apply_governed_tags") == "true"
 # MAGIC `DATE_TIME`, `URL` and `NRP` are ignored by default: product and vendor names are not PII
 # MAGIC and dominate Genie traffic. NER matches on allow-listed product terms (`allowlist_terms`) and
 # MAGIC on locale codes such as `en_GB` are dropped too; spaCy labels both as LOCATION.
+# MAGIC
+# MAGIC **Dates of birth.** Presidio has no date-of-birth recogniser, and its generic `DATE_TIME` is
+# MAGIC ignored because Genie traffic is full of dates. A custom `DATE_OF_BIRTH` recogniser matches
+# MAGIC common date formats, and a match only counts when birth wording (`DOB`, `date of birth`,
+# MAGIC `born`, `birthday`, ...) sits just before or after it, so dates in SQL and query results stay
+# MAGIC quiet.
+# MAGIC
+# MAGIC **Severity.** The scan records each entity's confidence in `details`; section 1b then sets each
+# MAGIC finding's `score` to confidence x the entity type's weight (`pii_weights`) and its `label` to
+# MAGIC the most severe entity.
 
 # COMMAND ----------
 
@@ -91,7 +118,34 @@ def _get_analyzer(spacy_model: str):
                 self.nlp = {"en": loaded}
 
         _ANALYZER = AnalyzerEngine(nlp_engine=LoadedSpacyNlpEngine(nlp), supported_languages=["en"])
+        _ANALYZER.registry.add_recognizer(_dob_recognizer())
     return _ANALYZER
+
+
+_MONTH = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
+DOB_PATTERNS = [
+    ("dob_numeric", r"\b\d{1,2}[/.-]\d{1,2}[/.-](?:19|20)\d{2}\b"),                           # 12/03/1985
+    ("dob_iso", r"\b(?:19|20)\d{2}[/.-]\d{1,2}[/.-]\d{1,2}\b"),                               # 1985-03-12
+    ("dob_day_month", rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+{_MONTH},?\s+(?:19|20)\d{{2}}\b"),       # 12 March 1985
+    ("dob_month_day", rf"\b{_MONTH}\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+(?:19|20)\d{{2}}\b"),       # March 12, 1985
+]
+# A date only counts as a date of birth with birth wording just before (60 chars) or after (25 chars),
+# a year at least DOB_MIN_AGE_YEARS ago (so "birthday lunch on 2024-06-01" is not a DOB), and outside
+# tool arguments (SQL / code, where "WHERE dob > '1990-01-01'" is a filter, not someone's birth date).
+DOB_CONTEXT_RE = re.compile(r"(?i)\b(?:d\.?o\.?b|date\s+of\s+birth|birth\s*date|birthday|born)\b")
+DOB_YEAR_RE = re.compile(r"(?:19|20)\d{2}")
+DOB_MIN_AGE_YEARS = 10
+DOB_EXCLUDED_FIELDS = {"tool_arguments"}
+
+
+def _dob_recognizer():
+    from presidio_analyzer import Pattern, PatternRecognizer
+
+    return PatternRecognizer(
+        supported_entity="DATE_OF_BIRTH",
+        patterns=[Pattern(name, regex, 0.85) for name, regex in DOB_PATTERNS],
+        supported_language="en",
+    )
 
 
 PRESIDIO_SCHEMA = "STRUCT<flagged:BOOLEAN, score:DOUBLE, label:STRING, entity_types:ARRAY<STRING>, entity_count:INT, details:STRING, error:STRING>"
@@ -113,7 +167,10 @@ def make_presidio_udf(spacy_model: str, threshold: float, ignore: list, allowlis
 
     @pandas_udf(PRESIDIO_SCHEMA)
     def presidio_scan(texts: pd.Series, requesters: pd.Series, fields: pd.Series) -> pd.DataFrame:
+        import datetime
+
         analyzer = _get_analyzer(spacy_model)
+        max_dob_year = datetime.date.today().year - DOB_MIN_AGE_YEARS
         rows = []
         for text, requester, field in zip(texts, requesters, fields):
             text = "" if text is None else str(text)
@@ -132,6 +189,12 @@ def make_presidio_udf(spacy_model: str, threshold: float, ignore: list, allowlis
                 snippet = text[r.start : r.end]
                 if r.entity_type == "EMAIL_ADDRESS" and snippet.lower() == requester:
                     continue
+                if r.entity_type == "DATE_OF_BIRTH":
+                    window = text[max(0, r.start - 60) : r.start] + " " + text[r.end : r.end + 25]
+                    year = DOB_YEAR_RE.search(snippet)
+                    if (field in DOB_EXCLUDED_FIELDS or not DOB_CONTEXT_RE.search(window)
+                            or not year or int(year.group(0)) > max_dob_year):
+                        continue  # an ordinary date, not a date of birth
                 if r.entity_type in NER_ENTITIES:
                     token = snippet.strip()
                     if field not in NER_FIELDS:
@@ -178,6 +241,41 @@ write_detections(scanned, "pii_presidio")
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ### 1b · Weight findings by entity type
+# MAGIC
+# MAGIC Re-scores every flagged PII finding (new and historical, Presidio and `ai_extract`) from the
+# MAGIC entities recorded in `details`: `score` = the highest confidence x weight, `label` = that
+# MAGIC entity's type. Runs on every execution, so editing `pii_weights` re-weights history.
+# MAGIC `detected_at` is not touched, so re-weighting never re-triggers alerts.
+
+# COMMAND ----------
+
+
+def sql_weight_map(weights: dict) -> str:
+    return "map(" + ", ".join(f"'{k}', CAST({float(v)} AS DOUBLE)" for k, v in sorted(weights.items())) + ")"
+
+
+PII_ENTITIES_SQL = "from_json(details:entities, 'ARRAY<STRUCT<type: STRING, score: DOUBLE>>')"
+# Ascending sort on (severity, type); the last element is the most severe entity.
+PII_RANKED_SQL = (
+    f"array_sort(transform({PII_ENTITIES_SQL}, e -> named_struct("
+    f"'severity', round(e.score * coalesce(try_element_at({sql_weight_map(PII_WEIGHTS)}, e.type), "
+    f"CAST({PII_DEFAULT_WEIGHT} AS DOUBLE)), 3), 'type', e.type)))"
+)
+
+spark.sql(f"""
+  UPDATE {DETECTIONS}
+  SET score = element_at({PII_RANKED_SQL}, -1).severity,
+      label = element_at({PII_RANKED_SQL}, -1).type
+  WHERE detector LIKE 'pii_%'
+    AND flagged
+    AND size({PII_ENTITIES_SQL}) > 0
+""")
+print("Re-weighted PII findings with", json.dumps(PII_WEIGHTS))
+
+# COMMAND ----------
+
 display(
     spark.sql(
         f"""
@@ -203,6 +301,12 @@ display(
 
 if RUN_AI_EXTRACT:
     labels = ["person", "email", "phone", "address", "credit_card", "national_id", "date_of_birth"]
+    # ai_extract label -> Presidio entity type, so weights and the session rollup apply unchanged
+    AI_EXTRACT_TO_ENTITY = {
+        "person": "PERSON", "email": "EMAIL_ADDRESS", "phone": "PHONE_NUMBER", "address": "LOCATION",
+        "credit_card": "CREDIT_CARD", "national_id": "US_SSN", "date_of_birth": "DATE_OF_BIRTH",
+    }
+    to_entity = F.create_map(*[F.lit(x) for kv in AI_EXTRACT_TO_ENTITY.items() for x in kv])
     label_arr = ", ".join(f"'{l}'" for l in labels)
     sample = candidates("pii_ai_extract", fields=["prompt", "response"]).orderBy(F.rand()).limit(AI_EXTRACT_SAMPLE)
     sample.createOrReplaceTempView("_pii_ai_sample")
@@ -219,7 +323,12 @@ if RUN_AI_EXTRACT:
         .withColumn("flagged", F.size("entity_types") > 0)
         .withColumn("score", F.when(F.col("flagged"), F.lit(0.8)).otherwise(F.lit(0.0)))
         .withColumn("label", F.element_at("entity_types", 1))
-        .withColumn("details", F.to_json(F.struct(F.col("entity_types"))))  # types only; values are not copied
+        # Types only, values are never copied. ai_extract gives no confidence: 0.8 is assumed, then
+        # weighted by entity type in section 1b on the next run (or re-run 1b now).
+        .withColumn("details", F.to_json(F.struct(F.transform("entity_types", lambda t: F.struct(
+            F.coalesce(F.try_element_at(to_entity, t), F.upper(t)).alias("type"),
+            F.lit(0.8).alias("score"),
+        )).alias("entities"))))
         .withColumn("error", F.when(F.col("ents").isNull(), F.lit("ai_extract returned null")))
         .drop("ents", "ents_map", "entity_types")
     )
@@ -293,6 +402,7 @@ ENTITY_TO_CLASS_TAG = {
     "UK_NHS": "class.uk_nhs",
     "IP_ADDRESS": "class.ip_address",
     "MEDICAL_LICENSE": "class.health_data",
+    "DATE_OF_BIRTH": "class.date_of_birth",
 }
 
 FIELD_TO_COLUMN = {

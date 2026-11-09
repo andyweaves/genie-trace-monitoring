@@ -6,7 +6,7 @@
 
 CREATE OR REFRESH MATERIALIZED VIEW genie_sessions
 CLUSTER BY (session_date, product)
-COMMENT 'One row per Genie conversation. Flat: when/who, conversation_id, product, is_flagged, risk_score. Structs: activity, flags, risk, feedback, context.'
+COMMENT 'One row per Genie conversation. Flat: when/who, conversation_id, product, is_flagged, risk_score, severity. Structs: activity, flags, risk, feedback, context.'
 TBLPROPERTIES ('quality' = 'gold')
 AS
 WITH turns AS (
@@ -68,7 +68,12 @@ detections AS (
     max(CASE WHEN flagged THEN detected_at END)             AS last_flagged_at,
     max(CASE WHEN flagged AND detector LIKE 'pii_%' THEN score END)              AS max_pii_score,
     max(CASE WHEN flagged AND detector LIKE 'prompt_injection_%' THEN score END) AS max_prompt_injection_score,
-    max(CASE WHEN flagged AND detector = 'guardrail_signal' THEN score END)      AS max_guardrail_score
+    max(CASE WHEN flagged AND detector = 'guardrail_signal' THEN score END)      AS max_guardrail_score,
+    -- Every PII entity type found in the session (not only each finding's top label), from details
+    array_sort(array_distinct(flatten(collect_list(
+      CASE WHEN flagged AND detector LIKE 'pii_%'
+           THEN transform(from_json(details:entities, 'ARRAY<STRUCT<type: STRING>>'), e -> e.type) END
+    ))))                                                    AS pii_entity_types
   FROM ${catalog}.${schema}.genie_detections
   GROUP BY conversation_id
 ),
@@ -90,6 +95,30 @@ feedback AS (
   JOIN turns r ON r.trace_id = f.trace_id
   WHERE f.rn = 1 AND f.annotation_change_type <> 'delete'
   GROUP BY r.conversation_id
+),
+risk_inputs AS (
+  SELECT
+    t.conversation_id,
+    coalesce(d.has_pii OR d.has_prompt_injection OR d.has_guardrail_signal, false) AS is_flagged,
+    -- PII scores are already weighted by entity type in 02_detect_pii, so they count in full.
+    coalesce(d.max_pii_score, 0)
+      + coalesce(d.max_prompt_injection_score, 0) * 0.8
+      + coalesce(d.max_guardrail_score, 0)                                     AS base_score,
+    CASE WHEN coalesce(c.rejected_tool_call_count, 0) > 0 THEN 0.2 ELSE 0.0 END AS rejected_tool_call_bonus,
+    -- A name together with a date of birth, phone number or location identifies a person far
+    -- better than either alone.
+    CASE WHEN array_contains(d.pii_entity_types, 'PERSON')
+              AND arrays_overlap(d.pii_entity_types, array('DATE_OF_BIRTH', 'PHONE_NUMBER', 'LOCATION'))
+         THEN 0.2 ELSE 0.0 END                                                 AS pii_combination_bonus
+  FROM turn_agg t
+  LEFT JOIN tool_agg   c ON c.conversation_id = t.conversation_id
+  LEFT JOIN detections d ON d.conversation_id = t.conversation_id
+),
+risk AS (
+  SELECT
+    *,
+    least(1.0, base_score + rejected_tool_call_bonus + pii_combination_bonus) AS risk_score
+  FROM risk_inputs
 )
 SELECT
   -- When and who
@@ -104,13 +133,12 @@ SELECT
   -- Keys and the two most-filtered flags stay flat
   t.conversation_id,
   t.product,
-  coalesce(d.has_pii OR d.has_prompt_injection OR d.has_guardrail_signal, false) AS is_flagged,
-  least(1.0,
-    coalesce(d.max_pii_score, 0) * 0.4
-    + coalesce(d.max_prompt_injection_score, 0) * 0.8
-    + coalesce(d.max_guardrail_score, 0)
-    + CASE WHEN coalesce(c.rejected_tool_call_count, 0) > 0 THEN 0.2 ELSE 0 END
-  )                                                                      AS risk_score,
+  r.is_flagged,
+  r.risk_score,
+  CASE WHEN NOT r.is_flagged    THEN 'none'
+       WHEN r.risk_score >= 0.8 THEN 'high'
+       WHEN r.risk_score >= 0.5 THEN 'medium'
+       ELSE 'low' END                                                    AS severity,
 
   -- What happened in the session
   named_struct(
@@ -137,16 +165,19 @@ SELECT
     'flagged_turn_count',   coalesce(d.flagged_turn_count, 0),
     'flag_detectors',       coalesce(d.flag_detectors, array()),
     'flag_labels',          coalesce(d.flag_labels, array()),
+    'pii_entity_types',     coalesce(d.pii_entity_types, array()),
     'first_flagged_at',     d.first_flagged_at,
     'last_flagged_at',      d.last_flagged_at
   )                                                                      AS flags,
 
-  -- Per-detector maxima behind risk_score. Weights: 0.4 PII, 0.8 injection, 1.0 guardrail, +0.2 if a tool call was rejected.
+  -- What drove risk_score = min(1, PII (weighted by entity type) + 0.8 x injection + guardrail
+  -- + 0.2 if a tool call was rejected + 0.2 if a name appears with a DOB, phone or location).
   named_struct(
     'max_pii_score',              d.max_pii_score,
     'max_prompt_injection_score', d.max_prompt_injection_score,
     'max_guardrail_score',        d.max_guardrail_score,
-    'rejected_tool_call_bonus',   CASE WHEN coalesce(c.rejected_tool_call_count, 0) > 0 THEN 0.2 ELSE 0.0 END::DOUBLE
+    'rejected_tool_call_bonus',   r.rejected_tool_call_bonus::DOUBLE,
+    'pii_combination_bonus',      r.pii_combination_bonus::DOUBLE
   )                                                                      AS risk,
 
   -- Thumbs up / down from the annotations table
@@ -168,4 +199,5 @@ SELECT
 FROM turn_agg t
 LEFT JOIN tool_agg   c  ON c.conversation_id  = t.conversation_id
 LEFT JOIN detections d  ON d.conversation_id  = t.conversation_id
-LEFT JOIN feedback   fb ON fb.conversation_id = t.conversation_id;
+LEFT JOIN feedback   fb ON fb.conversation_id = t.conversation_id
+JOIN      risk       r  ON r.conversation_id  = t.conversation_id;
