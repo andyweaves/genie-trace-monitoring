@@ -388,21 +388,27 @@ except Exception as e:  # noqa: BLE001
 
 # COMMAND ----------
 
+# Presidio entity type -> the most specific governed class.* tag Databricks Data Classification uses,
+# so ABAC policies written against class.* cover both. Types with no matching tag (CRYPTO, NRP,
+# DATE_TIME, UUID) are not tagged.
 ENTITY_TO_CLASS_TAG = {
     "EMAIL_ADDRESS": "class.email_address",
     "PHONE_NUMBER": "class.phone_number",
     "PERSON": "class.name",
     "LOCATION": "class.location",
-    "CREDIT_CARD": "class.credit_card",
-    "IBAN_CODE": "class.bank_number",
-    "US_BANK_NUMBER": "class.bank_number",
-    "US_SSN": "class.us_ssn",
-    "US_PASSPORT": "class.passport",
-    "US_DRIVER_LICENSE": "class.driver_license",
-    "UK_NHS": "class.uk_nhs",
-    "IP_ADDRESS": "class.ip_address",
-    "MEDICAL_LICENSE": "class.health_data",
     "DATE_OF_BIRTH": "class.date_of_birth",
+    "CREDIT_CARD": "class.credit_card",
+    "IBAN_CODE": "class.iban_code",
+    "US_BANK_NUMBER": "class.us_bank_number",
+    "US_SSN": "class.us_ssn",
+    "US_ITIN": "class.us_itin",
+    "US_PASSPORT": "class.us_passport",
+    "US_DRIVER_LICENSE": "class.us_driver_license",
+    "UK_NHS": "class.uk_nhs",
+    "MEDICAL_LICENSE": "class.medical_license",
+    "IP_ADDRESS": "class.ip_address",
+    "MAC_ADDRESS": "class.mac_address",
+    "URL": "class.url",
 }
 
 FIELD_TO_COLUMN = {
