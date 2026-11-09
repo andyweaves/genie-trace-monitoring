@@ -17,6 +17,7 @@ workspace with a single `databricks bundle deploy`.
 - [Quick start](#quick-start)
 - [Detections](#detections)
 - [Tuning](#tuning)
+- [PII: Presidio and Data Classification](#pii-presidio-and-data-classification)
 - [What the trace does and does not contain](#what-the-trace-does-and-does-not-contain)
 - [Related platform controls](#related-platform-controls)
 - [Repository layout](#repository-layout)
@@ -275,6 +276,76 @@ Weights live in `src/pipelines/sessions/transformations/genie_sessions.sql`.
   `06_table_guide`) is rendered from `docs/table_guide_architecture.svg` by
   `docs/render_diagram.sh`. Re-render it whenever a table is added, renamed or re-wired.
 
+## PII: Presidio and Data Classification
+
+[Unity Catalog Data Classification](https://docs.databricks.com/aws/en/data-governance/unity-catalog/data-classification)
+can find PII with no code at all, so it is natural to ask whether it can replace the Presidio
+scan in `02_detect_pii`. For governance it is excellent; for monitoring it is not enough on its
+own, because it works at the **column** level.
+
+| Capability | Presidio (`02_detect_pii`) | Data Classification only |
+|---|---|---|
+| Which session, turn and field contained PII | ✅ one finding per span and field | ❌ which *column* has contained PII |
+| `has_pii`, `severity`, `risk_score` per session | ✅ | ❌ |
+| "Sessions to review" alert on new PII | ✅ every hourly run | ❌ |
+| Severity weighting (card ≫ name), name + date-of-birth bonus | ✅ | ❌ |
+| Governed `class.*` tags for ABAC | ✅ on the five scanned columns | ✅ on the columns it classifies, including raw payload copies |
+| Freshness | Hourly | Background scan, new columns typically within 24 hours |
+| Effort | Presidio, spaCy wheel, allow-list tuning | Enable it |
+
+The core limitation: the first prompt containing a name tags `genie_turns.prompt` with
+`class.name`, and the column stays tagged. A card number pasted the next day produces no new
+signal, because classification answers "has this column ever contained PII", not "which
+conversation just did".
+
+### Recommended: use both
+
+* **Presidio** for monitoring: row-level findings, session severity and the alert.
+* **Data Classification** for tag coverage. `02_detect_pii` only tags the columns it scans
+  (`prompt`, `response`, `tool_arguments`, `tool_result`, `response_text`); the same text is also
+  in `input_messages_raw`, `output_messages_raw`, the `attributes` VARIANT and
+  `genie_sessions.context`. Classification scans the materialized views' columns, so with
+  auto-tagging on, the ABAC policy in `src/sql/access_control.sql` also masks the raw copies it
+  classifies. Check which columns actually got tags (`06_table_guide`, section 6): struct and
+  VARIANT columns such as `context` and `attributes` may not be classified, so keep the grants in
+  `access_control.sql` as the primary control.
+
+To enable it alongside Presidio:
+
+1. Catalog Explorer → catalog → **Details** → **Data Classification** → **Enable**, for the whole
+   catalog or just the `genie_tracing` schema. Needs `MANAGE` (or ownership) and serverless
+   compute.
+2. Turn on **auto-tagging** for the classes the ABAC policy matches (`class.name`,
+   `class.email_address`, `class.phone_number`, `class.location`, `class.date_of_birth`,
+   `class.credit_card`, `class.us_ssn`, ...). Applying tags needs `APPLY TAG` and `ASSIGN`.
+3. Check results with the `system.data_classification.results` query in `00_setup` (section 4) or
+   `02_detect_pii` (section 3), and the applied tags in `06_table_guide` (section 6).
+
+### Data Classification only
+
+For a deployment that will not run Presidio:
+
+* Remove the `detect_pii` task from `resources/genie_tracing_monitoring.job.yml`, and from
+  `sessions_pipeline`'s `depends_on`. The spaCy wheel (prerequisite 5) and the `detections`
+  environment are then no longer needed.
+* `has_pii` stays false, PII contributes nothing to `risk_score`, and the "sessions to review"
+  alert covers prompt injection and guardrail signals only. PII becomes a **governance control**
+  (tag, then mask with ABAC) rather than a monitored signal.
+* `genie_session_timeline` and `genie_detections` no longer show PII; use Catalog Explorer or
+  `system.data_classification.results` to see which columns have carried it.
+
+### Caveats
+
+* `system.data_classification.results` stores **sample values** from the scanned columns, which
+  here means fragments of real prompts. Restrict `SELECT` on it as tightly as the
+  `genie_tracing` schema itself.
+* Detections typically land within 24 hours; a full rescan can be triggered from the UI.
+* Turning auto-tagging off stops new tags but does not remove existing ones.
+* Regular views (`genie_session_timeline`) are only scanned with the Beta view-scanning preview,
+  and view columns are not tagged by default.
+* Classification is billed as serverless compute; the first scan costs more than later
+  incremental ones.
+
 ## What the trace does and does not contain
 
 Verified against live traces in November 2026. These shape what the detectors can and cannot do.
@@ -312,7 +383,9 @@ Verified against live traces in November 2026. These shape what the detectors ca
   the trace table's `events` column. They do not cover Genie itself, which is why this
   accelerator scans after the fact.
 * **Unity Catalog Data Classification** tags columns automatically; `02_detect_pii` applies the
-  same `class.*` tags from row-level findings so one ABAC policy covers both.
+  same `class.*` tags from row-level findings so one ABAC policy covers both. See
+  [PII: Presidio and Data Classification](#pii-presidio-and-data-classification) for how they fit
+  together.
 * **`system.access.assistant_events`** records one row per Genie Code message (who, where, when)
   without content, useful as a cross-check on trace completeness.
 

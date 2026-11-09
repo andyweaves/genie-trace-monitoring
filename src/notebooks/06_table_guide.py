@@ -388,12 +388,16 @@ GROUP BY ALL ORDER BY detector, findings DESC
 # MAGIC
 # MAGIC | Why it matters | |
 # MAGIC |---|---|
-# MAGIC | 🛡️ ABAC | One policy on `hasTag('class.email_address')` masks the column for everyone outside the security group, whether Data Classification or Presidio found it |
+# MAGIC | 🛡️ ABAC | One policy on `has_tag('class.email_address') OR ...` (see `src/sql/access_control.sql`) masks the column for everyone outside the security group, whether Data Classification or Presidio found it |
 # MAGIC | 🔎 Discovery | Catalog Explorer and `system.information_schema.column_tags` show at a glance which trace columns have carried PII |
 # MAGIC | 📊 Column vs row | Tags say "this column *has contained* PII". `genie_detections` says *which rows*. Use both. |
 # MAGIC
 # MAGIC Assigning governed tags needs `ASSIGN` on each tag (account admins by default). If the
 # MAGIC notebook reports a permission failure, the detections are still written; only the tag is skipped.
+# MAGIC
+# MAGIC Presidio only tags the columns it scans. Turning on Data Classification with auto-tagging for
+# MAGIC this schema also tags the raw payload columns it classifies (e.g. `input_messages_raw`,
+# MAGIC `output_messages_raw`), so the same ABAC policy masks them. Check the query below for what was tagged. See *PII: Presidio and Data Classification* in the README.
 
 # COMMAND ----------
 
