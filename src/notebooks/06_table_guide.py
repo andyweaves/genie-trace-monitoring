@@ -74,8 +74,9 @@ print(f"Using conversation_id = {conversation_id or '(none found)'}")
 
 
 def q(sql: str):
-    """Run a query against the guide schema and display it."""
-    display(spark.sql(sql))
+    """Run a query against the guide schema and display it. Binds :conversation_id if used."""
+    args = {"conversation_id": conversation_id} if ":conversation_id" in sql else None
+    display(spark.sql(sql, args=args))
 
 # COMMAND ----------
 
@@ -182,7 +183,7 @@ SELECT step_number, turn_number, started_at, duration_ms, event_type, event_name
        substr(output_text, 1, 300) AS output_text,
        outcome.outcome, outcome.is_error, outcome.is_rejected_or_refused, detections.flags, span.previous_event, span.next_event
 FROM {FQ}.genie_session_timeline
-WHERE conversation_id = '{conversation_id}'
+WHERE conversation_id = :conversation_id
 ORDER BY step_number
 """)
 
@@ -225,7 +226,7 @@ SELECT started_at, duration_ms, product, requester, context.channel, is_error, i
        outcome.run_outcome, outcome.genie_status, outcome.status_code,
        prompt, response, citations, completeness.payload_truncated, trace_id
 FROM {FQ}.genie_turns
-WHERE conversation_id = '{conversation_id}'
+WHERE conversation_id = :conversation_id
 ORDER BY started_at
 """)
 
@@ -285,7 +286,7 @@ SELECT started_at, span_type, tool_name, outcome.tool_outcome, is_error, is_reje
        substr(tool_result, 1, 400)    AS tool_result,
        trace_id, span_id
 FROM {FQ}.genie_tool_calls
-WHERE conversation_id = '{conversation_id}'
+WHERE conversation_id = :conversation_id
   AND span_type <> 'model_call'
 ORDER BY started_at
 """)
@@ -338,7 +339,7 @@ GROUP BY ALL ORDER BY calls DESC
 # MAGIC | `pii_ai_extract` | 02 (opt-in) | LLM-extracted PII on a sample | 0.8 fixed |
 # MAGIC | `prompt_injection_prompt_guard` | 03 | Llama Prompt Guard 2 malicious probability, chunked | model score; flagged ≥ 0.85 |
 # MAGIC | `prompt_injection_ai_classify` | 03 | LLM judge: legitimate / destructive-or-boundary-pushing / injection | 0.7 injection, 0.3 boundary (not flagged) |
-# MAGIC | `guardrail_signal` | 04 | Rules over outcomes and text: `guardrail_intervention` (0.8), `destructive_action_executed` (0.7), `injection_recognised` (0.6), `refusal_text` (0.5), `boundary_pushing_prompt` (0.5), `tool_user_rejected` (0.5), `approval_requested` (0.3), ... | rule severity |
+# MAGIC | `guardrail_signal` | 04 | Rules over outcomes and text: `guardrail_intervention` (0.8), `destructive_action_executed` (0.7), `injection_recognised` (0.6), `refusal_text` (0.5), `boundary_pushing_prompt` (0.5), `tool_user_rejected` (0.5), ...; `approval_requested`, `turn_error`, `tool_error` are informational | rule severity |
 # MAGIC
 # MAGIC **Things to know**
 # MAGIC * `details` never copies the PII value itself for Presidio, only entity type and offsets.
@@ -352,7 +353,7 @@ GROUP BY ALL ORDER BY calls DESC
 q(f"""
 SELECT span_time, detected_at, detector, flagged, ROUND(score, 3) AS score, label, span.field, details, span.span_id
 FROM {FQ}.genie_detections
-WHERE conversation_id = '{conversation_id}'
+WHERE conversation_id = :conversation_id
 ORDER BY flagged DESC, score DESC, span_time
 """)
 
@@ -452,7 +453,7 @@ GROUP BY ALL ORDER BY category, spans DESC
 
 q(f"""
 WITH first_turn AS (
-  SELECT trace_id FROM {FQ}.genie_turns WHERE conversation_id = '{conversation_id}' ORDER BY started_at LIMIT 1
+  SELECT trace_id FROM {FQ}.genie_turns WHERE conversation_id = :conversation_id ORDER BY started_at LIMIT 1
 )
 SELECT s.time, s.name, s.parent_span_id, s.status.code AS status_code, to_json(s.attributes) AS attributes
 FROM {SOURCE_TABLE} s

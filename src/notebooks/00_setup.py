@@ -27,6 +27,8 @@ dbutils.widgets.text("libs_volume", "genie_tracing_libs", "Libraries volume")
 dbutils.widgets.text("source_table", "unity_gateway.unified_tracing.unity_gateway_otel_spans", "Unified trace table")
 dbutils.widgets.text("spacy_model", "en_core_web_md", "spaCy model")
 dbutils.widgets.text("spacy_version", "3.8.0", "spaCy model version")
+dbutils.widgets.text("genie_one_service", "Genie One", "Genie One service_name")
+dbutils.widgets.text("genie_code_service", "genie-code-agent", "Genie Code service_name")
 
 CATALOG = dbutils.widgets.get("catalog")
 SCHEMA = dbutils.widgets.get("schema")
@@ -34,6 +36,8 @@ LIBS_VOLUME = dbutils.widgets.get("libs_volume")
 SOURCE_TABLE = dbutils.widgets.get("source_table")
 SPACY_MODEL = dbutils.widgets.get("spacy_model")
 SPACY_VERSION = dbutils.widgets.get("spacy_version")
+GENIE_ONE_SERVICE = dbutils.widgets.get("genie_one_service")
+GENIE_CODE_SERVICE = dbutils.widgets.get("genie_code_service")
 
 FQ = f"`{CATALOG}`.`{SCHEMA}`"
 VOLUME_PATH = f"/Volumes/{CATALOG}/{SCHEMA}/{LIBS_VOLUME}"
@@ -60,7 +64,7 @@ display(
                COUNT(DISTINCT trace_id)   AS traces,
                MIN(time)                  AS first_seen,
                MAX(time)                  AS last_seen,
-               CASE WHEN service_name IN ('Genie One', 'genie-code-agent') THEN 'Genie' ELSE 'other AI Gateway traffic' END AS category
+               CASE WHEN service_name IN ('{GENIE_ONE_SERVICE}', '{GENIE_CODE_SERVICE}') THEN 'Genie' ELSE 'other AI Gateway traffic' END AS category
         FROM {SOURCE_TABLE}
         GROUP BY service_name
         ORDER BY category, spans DESC
@@ -81,30 +85,17 @@ display(
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {FQ} COMMENT 'Genie One / Genie Code trace monitoring'")
 spark.sql(f"CREATE VOLUME IF NOT EXISTS {FQ}.`{LIBS_VOLUME}` COMMENT 'Wheels and model files for detection notebooks'")
 dbutils.fs.mkdirs(WHEEL_DIR)
+print(f"Schema {CATALOG}.{SCHEMA} and volume {VOLUME_PATH} are ready.")
 
-spark.sql(
-    f"""
-    CREATE TABLE IF NOT EXISTS {FQ}.genie_detections (
-      span_time       TIMESTAMP,
-      detected_at     TIMESTAMP,
-      workspace_id    STRING,
-      requester       STRING,
-      conversation_id STRING,
-      product         STRING,
-      detector        STRING,
-      flagged         BOOLEAN,
-      score           DOUBLE,
-      label           STRING,
-      span            STRUCT<trace_id: STRING, span_id: STRING, field: STRING, text_length: INT>,
-      details         STRING,
-      detection_id    STRING    NOT NULL
-    )
-    CLUSTER BY (span_time, detector)
-    COMMENT 'Per-span detection results for Genie traces: PII, prompt injection and guardrail signals.'
-    TBLPROPERTIES ('delta.enableRowTracking' = 'true', 'delta.enableChangeDataFeed' = 'true')
-    """
-)
-print(f"Schema {CATALOG}.{SCHEMA}, volume {VOLUME_PATH} and genie_detections are ready.")
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC The `genie_detections` table is created by the shared detection utilities, so its definition
+# MAGIC lives in one place.
+
+# COMMAND ----------
+
+# MAGIC %run ./_detection_utils
 
 # COMMAND ----------
 
@@ -115,8 +106,10 @@ print(f"Schema {CATALOG}.{SCHEMA}, volume {VOLUME_PATH} and genie_detections are
 # MAGIC have no internet access, so the model is installed from a wheel in the volume via the job's
 # MAGIC environment `dependencies`. This cell downloads the wheel from GitHub. If your workspace
 # MAGIC blocks GitHub egress (this one does), download it on your laptop and upload it to the path
-# MAGIC printed below. Presidio still runs without the model, using pattern recognisers only
-# MAGIC (email, phone, credit card, IBAN, IP, SSN, ...).
+# MAGIC printed below. Run interactively, `02_detect_pii` still works without the model, using
+# MAGIC pattern recognisers only (email, phone, credit card, IBAN, IP, SSN, ...). The scheduled
+# MAGIC job's `detect_pii` task lists the wheel as a dependency and fails until it is staged; the
+# MAGIC prompt-injection and guardrail tasks use a separate environment and are unaffected.
 
 # COMMAND ----------
 

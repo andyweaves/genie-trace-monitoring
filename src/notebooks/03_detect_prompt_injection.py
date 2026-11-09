@@ -50,12 +50,13 @@ INDIRECT_FIELDS = ["tool_result", "model_output"]
 # COMMAND ----------
 
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.serving import EndpointStateReady
 
 ws = WorkspaceClient()
 try:
     ep = ws.serving_endpoints.get(PROMPT_GUARD_ENDPOINT)
     print(f"{PROMPT_GUARD_ENDPOINT}: state={ep.state.ready}, config_update={ep.state.config_update}")
-    PROMPT_GUARD_AVAILABLE = str(ep.state.ready).endswith("READY")
+    PROMPT_GUARD_AVAILABLE = ep.state.ready == EndpointStateReady.READY  # NOT_READY must not match
 except Exception as e:  # noqa: BLE001
     print(f"Endpoint {PROMPT_GUARD_ENDPOINT} not available ({type(e).__name__}). Run 01_deploy_prompt_guard first.")
     PROMPT_GUARD_AVAILABLE = False
@@ -67,7 +68,8 @@ except Exception as e:  # noqa: BLE001
 # MAGIC
 # MAGIC `ai_query` fans the rows out to the endpoint and parses the response into a STRUCT. The
 # MAGIC endpoint chunks long text internally and returns the maximum malicious probability.
-# MAGIC `failOnError => false` keeps one bad row from failing the whole scan.
+# MAGIC `failOnError => false` keeps one bad row from failing the whole scan; rows that errored are
+# MAGIC not written, so they are retried on the next run.
 
 # COMMAND ----------
 
@@ -97,8 +99,9 @@ if PROMPT_GUARD_AVAILABLE:
         .withColumn("details", F.to_json(F.struct(
             F.when(F.col("field").isin(DIRECT_FIELDS), F.lit("direct")).otherwise(F.lit("indirect")).alias("vector"),
             F.col("pg.result.n_chunks").alias("n_chunks"),
-            F.col("pg.errorMessage").alias("error"),
         )))
+        .withColumn("error", F.when(F.col("pg.result").isNull(),
+                                    F.coalesce(F.col("pg.errorMessage"), F.lit("no result from endpoint"))))
         .drop("pg")
     )
     write_detections(pg_detections, "prompt_injection_prompt_guard")
@@ -144,7 +147,6 @@ if RUN_AI_CLASSIFY:
         .unionByName(base.orderBy(F.rand()).limit(AI_CLASSIFY_SAMPLE))
         .dropDuplicates(["span_id", "field"])
     )
-    print(f"Rows for ai_classify: {to_judge.count()}")
     to_judge.createOrReplaceTempView("_ai_classify_candidates")
 
     judged = spark.sql(
@@ -170,6 +172,7 @@ if RUN_AI_CLASSIFY:
         .withColumn("label", F.col("verdict"))
         .withColumn("details", F.to_json(F.struct(
             F.when(F.col("field").isin(DIRECT_FIELDS), F.lit("direct")).otherwise(F.lit("indirect")).alias("vector"))))
+        .withColumn("error", F.when(F.col("verdict").isNull(), F.lit("ai_classify returned null")))
         .drop("verdict")
     )
     write_detections(ai_detections, "prompt_injection_ai_classify")

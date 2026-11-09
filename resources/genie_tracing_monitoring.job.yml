@@ -25,6 +25,8 @@ resources:
           default: ${var.detection_lookback_days}
 
       environments:
+        # PII task only: Presidio + spaCy and the model wheel staged by 00_setup. Kept separate so a
+        # missing wheel fails detect_pii without blocking the other detectors.
         - environment_key: detections
           spec:
             environment_version: "4"
@@ -34,6 +36,10 @@ resources:
               - spacy>=3.8,<3.9
               # spaCy English model staged in the libs volume by 00_setup.
               - /Volumes/${var.catalog}/${var.schema}/${var.libs_volume}/wheels/en_core_web_md-3.8.0-py3-none-any.whl
+        # Prompt-injection and guardrail tasks: no extra libraries needed.
+        - environment_key: base
+          spec:
+            environment_version: "4"
 
       tasks:
         - task_key: etl_pipeline
@@ -50,14 +56,14 @@ resources:
         - task_key: detect_prompt_injection
           depends_on:
             - task_key: etl_pipeline
-          environment_key: detections
+          environment_key: base
           notebook_task:
             notebook_path: ../src/notebooks/03_detect_prompt_injection.py
 
         - task_key: detect_guardrail_signals
           depends_on:
             - task_key: etl_pipeline
-          environment_key: detections
+          environment_key: base
           notebook_task:
             notebook_path: ../src/notebooks/04_detect_guardrail_signals.py
 

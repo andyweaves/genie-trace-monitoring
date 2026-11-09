@@ -142,7 +142,7 @@ processing (`CREATE OR REFRESH STREAMING TABLE ... FROM STREAM(...)`).
 | `04_detect_guardrail_signals.py` | Rule-based signals over outcomes and text; query to discover the guardrail's own wording |
 | `05_session_explorer.py` | Adoption, flagged sessions, session walkthrough, approval flows, tool usage, thumbs-down |
 | `06_table_guide.py` | Guided tour of every table in triage order, with a brief and a runnable query per table. **Start here if you are new to the schema.** |
-| `_detection_utils.py` | Shared config, candidate selection, idempotent MERGE into `genie_detections` |
+| `_detection_utils.py` | Shared config, `genie_detections` DDL, candidate selection, idempotent MERGE into `genie_detections` (scored once via a staging table; errored rows skipped for retry) |
 
 `src/sql/access_control.sql` has grants, a workspace row filter, column masks and an ABAC
 policy sketch. Apply them before widening access: **the derived tables contain full prompts,
@@ -163,7 +163,9 @@ responses, SQL and tool results**, readable by anyone with `SELECT`.
    `genie_tracing`, key `hf_token`).
 5. The spaCy model wheel in the libs volume (see `00_setup`). If GitHub egress is blocked from
    your workspace, download `en_core_web_md-3.8.0-py3-none-any.whl` elsewhere and upload it.
-   Presidio still works without it using pattern recognisers only.
+   The job's `detect_pii` task installs it as a dependency and fails until it is staged; the
+   prompt-injection and guardrail tasks run in a separate environment and are unaffected. Run
+   interactively, `02_detect_pii` falls back to Presidio's pattern recognisers without it.
 6. Databricks CLI ≥ 1.0 authenticated to the workspace.
 
 ### Deploy
@@ -216,7 +218,8 @@ Guardrail rules, highest severity first: `guardrail_intervention` (classifier pr
 `Action denied:` and `Review suggested:`), `destructive_action_executed` ("I dropped …"),
 `tool_permission_denied`, `injection_recognised`, `refusal_text`, `boundary_pushing_prompt`,
 `tool_user_rejected`, `sensitive_arguments`, `destructive_confirmation_requested`,
-`external_destination`, `approval_requested`, plus informational `turn_error` and `tool_error`.
+`external_destination`, plus informational `approval_requested`, `turn_error` and `tool_error`
+(recorded in `genie_detections`, but they do not flag the session or add to `risk_score`).
 
 Session `risk_score` = min(1, 0.4·PII + 0.8·injection + guardrail severity + 0.2 if a tool call
 was rejected). Weights live in `src/pipelines/sessions/transformations/genie_sessions.sql`.
@@ -235,7 +238,11 @@ was rejected). Weights live in `src/pipelines/sessions/transformations/genie_ses
   and `DESTRUCTIVE_EXECUTED_REGEX` in `04_detect_guardrail_signals` as you see new phrasing. The
   last cell of that notebook lists recent non-success turns to mine for it.
 * **Scan scope**: a model-call output identical to the turn's final response is scanned once, as
-  the response. Guardrail rules clear and re-score their lookback window on every run.
+  the response. Guardrail rules re-score their lookback window on every run in a single MERGE:
+  hits that no longer match are deleted, unchanged hits keep their original `detected_at`, so
+  alerts fire once per finding rather than every hour.
+* **Failed scans**: rows where Presidio, Prompt Guard or `ai_classify` errored are not written,
+  so they are retried on the next run while still inside the lookback window.
 * **Diagram**: `src/notebooks/images/table_guide_architecture.png` (used above and in
   `06_table_guide`) is rendered from `docs/table_guide_architecture.svg` by
   `docs/render_diagram.sh`. Re-render it whenever a table is added, renamed or re-wired.

@@ -34,7 +34,8 @@
 # MAGIC
 # MAGIC Each rule is a SQL predicate over `genie_turns` or `genie_tool_calls`. `score` is the
 # MAGIC severity contributed to the session risk score. `flagged = false` rules are informational:
-# MAGIC they appear in the timeline but do not flag the session.
+# MAGIC they are recorded in `genie_detections` for querying but do not flag the session, add to
+# MAGIC `risk_score` or show in the timeline's `detections.flags`.
 
 # COMMAND ----------
 
@@ -190,7 +191,9 @@ RULES = [
     dict(name="tool_permission_denied", source="tools", flagged=True, score=0.7,
          predicate="tool_outcome = 'PERMISSION_DENIED'",
          evidence="named_struct('tool_name', tool_name, 'tool_outcome', tool_outcome, 'arguments', substr(tool_arguments, 1, 500))"),
-    dict(name="approval_requested", source="tools", flagged=True, score=0.3,
+    # Informational: an approval request is the guardrail working as designed, not misuse.
+    # Rejections and destructive actions are flagged by the rules around it.
+    dict(name="approval_requested", source="tools", flagged=False, score=0.3,
          predicate="span_type = 'approval_request'",
          evidence="named_struct('tool_name', tool_name, 'arguments', substr(tool_arguments, 1, 500))"),
     dict(name="destructive_tool", source="tools", flagged=True, score=0.5,
@@ -214,10 +217,19 @@ print(f"{len(RULES)} rules defined")
 # MAGIC %md
 # MAGIC ## Evaluate rules
 # MAGIC
-# MAGIC Rules are evaluated over the whole lookback window on every run. Existing rule rows in the
-# MAGIC window are deleted first, so editing or removing a pattern re-scores history cleanly.
+# MAGIC Rules are evaluated over the whole lookback window on every run and MERGEd in one statement:
+# MAGIC rows for hits that no longer match (a pattern was edited or removed) are deleted, new hits are
+# MAGIC inserted, and unchanged hits keep their original `detected_at` so the alerts fire once, not
+# MAGIC every hour. The window start is fixed once so the scan and the delete cover the same spans.
 
 # COMMAND ----------
+
+from datetime import datetime, timedelta, timezone
+
+# One cutoff for both the source scan and the MERGE's delete clause.
+_cutoff = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
+CUTOFF_SQL = f"TIMESTAMP'{_cutoff:%Y-%m-%d %H:%M:%S.%f}+00:00'"
+print(f"Re-scoring guardrail signals since {CUTOFF_SQL}")
 
 SOURCES = {
     "turns": f"""
@@ -227,7 +239,7 @@ SOURCES = {
                outcome.status_message AS status_message, is_error,
                coalesce(prompt, '') || ' ' || coalesce(response, '') AS text
         FROM {TURNS}
-        WHERE started_at >= current_timestamp() - INTERVAL {LOOKBACK_DAYS} DAYS
+        WHERE started_at >= {CUTOFF_SQL}
     """,
     "tools": f"""
         SELECT trace_id, span_id, coalesce(conversation_id, trace_id) AS conversation_id, product, workspace_id, requester,
@@ -235,7 +247,7 @@ SOURCES = {
                outcome.tool_outcome AS tool_outcome, outcome.status_message AS status_message, is_error,
                coalesce(tool_arguments, '') || ' ' || coalesce(tool_result, '') || ' ' || coalesce(response_text, '') AS text
         FROM {TOOL_CALLS}
-        WHERE started_at >= current_timestamp() - INTERVAL {LOOKBACK_DAYS} DAYS
+        WHERE started_at >= {CUTOFF_SQL}
     """,
 }
 
@@ -261,13 +273,7 @@ for name, sql in SOURCES.items():
     spark.sql(sql).createOrReplaceTempView(f"{name}_src")
 
 signals = spark.sql(" UNION ALL ".join(selects))
-
-spark.sql(f"""
-  DELETE FROM {DETECTIONS}
-  WHERE detector = 'guardrail_signal'
-    AND span_time >= current_timestamp() - INTERVAL {LOOKBACK_DAYS} DAYS
-""")
-write_detections(signals, "guardrail_signal")
+write_detections(signals, "guardrail_signal", rescore_since=CUTOFF_SQL)
 
 # COMMAND ----------
 

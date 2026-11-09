@@ -149,8 +149,17 @@ def candidates(detector: str, fields=None, lookback_days: int = LOOKBACK_DAYS):
 # MAGIC ## Writing detections
 # MAGIC
 # MAGIC `write_detections(df, detector)` expects the candidate columns plus `flagged`, `score`,
-# MAGIC `label`, `details`. It derives `detection_id` and `detected_at` and MERGEs, so re-running a
-# MAGIC detector over the same spans is safe.
+# MAGIC `label`, `details`, and optionally `error`. It derives `detection_id` and `detected_at` and
+# MAGIC MERGEs, so re-running a detector over the same spans is safe.
+# MAGIC
+# MAGIC * **Evaluated once.** The scored rows are written to a staging table first and the MERGE and
+# MAGIC   counts read from it, so a UDF or billed AI Function behind `df` runs exactly once.
+# MAGIC * **Errors are retried.** Rows with a non-null `error` are not written, so the field is still a
+# MAGIC   candidate on the next run (until it ages out of the lookback window).
+# MAGIC * **Stable `detected_at`.** An existing row keeps its `detected_at` unless its verdict (`flagged`
+# MAGIC   or `score`) changed, so alerts keyed on `detected_at` fire once per finding.
+# MAGIC * **Window re-scoring.** With `rescore_since`, this detector's rows from that time on that are no
+# MAGIC   longer produced are deleted in the same MERGE (used by the guardrail rules).
 
 # COMMAND ----------
 
@@ -161,8 +170,13 @@ DETECTION_COLUMNS = [
 ]
 
 
-def write_detections(df, detector: str) -> int:
-    """MERGE detector output into genie_detections. Returns the number of rows written."""
+def write_detections(df, detector: str, rescore_since: str = None) -> int:
+    """MERGE detector output into genie_detections. Returns the number of rows written.
+
+    rescore_since: optional SQL timestamp expression. When set, rows for `detector` with
+    span_time >= rescore_since that are not in `df` are deleted (full re-score of the window).
+    """
+    error_col = F.col("error").cast("string") if "error" in df.columns else F.lit(None).cast("string")
     out = (
         df.withColumn("detector", F.lit(detector))
         .withColumn("detection_id", F.sha2(F.concat_ws("|", F.col("span_id"), F.col("detector"), F.col("field")), 256))
@@ -177,20 +191,42 @@ def write_detections(df, detector: str) -> int:
             F.col("field").alias("field"),
             F.col("text_length").cast("int").alias("text_length"),
         ))
-        .select(*DETECTION_COLUMNS)
+        .select(*DETECTION_COLUMNS, error_col.alias("error"))
     )
-    n = out.count()
-    if n == 0:
-        print(f"[{detector}] nothing new to write")
-        return 0
-    view = f"_detections_{detector}_{abs(hash(detector)) % 10_000}"
-    out.createOrReplaceTempView(view)
-    spark.sql(f"""
-      MERGE INTO {DETECTIONS} AS d
-      USING {view} AS s ON d.detection_id = s.detection_id
-      WHEN MATCHED THEN UPDATE SET *
-      WHEN NOT MATCHED THEN INSERT *
-    """)
-    flagged = out.where("flagged").count()
-    print(f"[{detector}] wrote {n} rows, {flagged} flagged")
-    return n
+
+    # Materialise once: the MERGE and the counts below all read the staging table.
+    staging = f"{FQ}.`_staging_detections_{detector}`"
+    out.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(staging)
+    try:
+        stats = spark.sql(f"""
+          SELECT count_if(error IS NULL)             AS n,
+                 count_if(error IS NULL AND flagged) AS flagged,
+                 count_if(error IS NOT NULL)         AS errors
+          FROM {staging}
+        """).first()
+        if stats.errors:
+            print(f"[{detector}] {stats.errors} rows failed to score; not written, will be retried next run")
+        if stats.n == 0 and rescore_since is None:
+            print(f"[{detector}] nothing new to write")
+            return 0
+
+        update_set = ",\n            ".join(f"{c} = s.{c}" for c in DETECTION_COLUMNS if c != "detected_at")
+        delete_clause = (
+            f"WHEN NOT MATCHED BY SOURCE AND d.detector = '{detector}' AND d.span_time >= {rescore_since} THEN DELETE"
+            if rescore_since is not None else ""
+        )
+        spark.sql(f"""
+          MERGE INTO {DETECTIONS} AS d
+          USING (SELECT * EXCEPT (error) FROM {staging} WHERE error IS NULL) AS s
+          ON d.detection_id = s.detection_id
+          WHEN MATCHED THEN UPDATE SET
+            {update_set},
+            detected_at = CASE WHEN d.flagged <=> s.flagged AND d.score <=> s.score
+                               THEN d.detected_at ELSE s.detected_at END
+          WHEN NOT MATCHED THEN INSERT *
+          {delete_clause}
+        """)
+        print(f"[{detector}] wrote {stats.n} rows, {stats.flagged} flagged")
+        return stats.n
+    finally:
+        spark.sql(f"DROP TABLE IF EXISTS {staging}")

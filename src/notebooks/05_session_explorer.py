@@ -98,9 +98,10 @@ display(
                substr(output_text, 1, 400) AS output_text,
                outcome.outcome, outcome.status_code, outcome.is_rejected_or_refused, detections.flags, span.previous_event, span.next_event
         FROM {FQ}.genie_session_timeline
-        WHERE conversation_id = '{conversation_id}'
+        WHERE conversation_id = :conversation_id
         ORDER BY step_number
-        """
+        """,
+        args={"conversation_id": conversation_id},
     )
 )
 
@@ -116,9 +117,10 @@ display(
         f"""
         SELECT span_time, detected_at, detector, flagged, ROUND(score, 3) AS score, label, span.field, details, span.span_id, span.trace_id
         FROM {FQ}.genie_detections
-        WHERE conversation_id = '{conversation_id}'
+        WHERE conversation_id = :conversation_id
         ORDER BY flagged DESC, span_time, detector
-        """
+        """,
+        args={"conversation_id": conversation_id},
     )
 )
 

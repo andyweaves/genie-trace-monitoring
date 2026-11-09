@@ -94,7 +94,7 @@ def _get_analyzer(spacy_model: str):
     return _ANALYZER
 
 
-PRESIDIO_SCHEMA = "STRUCT<flagged:BOOLEAN, score:DOUBLE, label:STRING, entity_types:ARRAY<STRING>, entity_count:INT, details:STRING>"
+PRESIDIO_SCHEMA = "STRUCT<flagged:BOOLEAN, score:DOUBLE, label:STRING, entity_types:ARRAY<STRING>, entity_count:INT, details:STRING, error:STRING>"
 
 
 LOCALE_RE = re.compile(r"^[a-z]{2,3}[_-][A-Z]{2}$")
@@ -121,8 +121,9 @@ def make_presidio_udf(spacy_model: str, threshold: float, ignore: list, allowlis
             try:
                 results = analyzer.analyze(text=text, language="en", score_threshold=threshold)
             except Exception as e:  # noqa: BLE001
+                # Not written to genie_detections, so the field is retried on the next run.
                 rows.append({"flagged": False, "score": 0.0, "label": None, "entity_types": [], "entity_count": 0,
-                             "details": json.dumps({"error": f"{type(e).__name__}: {e}"})})
+                             "details": None, "error": f"{type(e).__name__}: {e}"[:500]})
                 continue
             kept = []
             for r in results:
@@ -153,6 +154,7 @@ def make_presidio_udf(spacy_model: str, threshold: float, ignore: list, allowlis
                 "entity_types": types,
                 "entity_count": len(kept),
                 "details": json.dumps({"entities": kept[:50], "truncated": len(kept) > 50}),
+                "error": None,
             })
         return pd.DataFrame(rows)
 
@@ -169,7 +171,7 @@ print(f"Fields to scan with Presidio: {pii_candidates.count()}")
 scanned = (
     pii_candidates
     .withColumn("r", presidio_scan(F.col("text"), F.col("requester"), F.col("field")))
-    .select("*", "r.flagged", "r.score", "r.label", "r.details")
+    .select("*", "r.flagged", "r.score", "r.label", "r.details", "r.error")
     .drop("r")
 )
 write_detections(scanned, "pii_presidio")
@@ -218,10 +220,24 @@ if RUN_AI_EXTRACT:
         .withColumn("score", F.when(F.col("flagged"), F.lit(0.8)).otherwise(F.lit(0.0)))
         .withColumn("label", F.element_at("entity_types", 1))
         .withColumn("details", F.to_json(F.struct(F.col("entity_types"))))  # types only; values are not copied
+        .withColumn("error", F.when(F.col("ents").isNull(), F.lit("ai_extract returned null")))
         .drop("ents", "ents_map", "entity_types")
     )
     write_detections(found, "pii_ai_extract")
-    display(found.select("product", "field", "flagged", "label", F.substring("text", 1, 120).alias("text")))
+    # Read back from genie_detections rather than `found`, which would call ai_extract again.
+    display(
+        spark.sql(
+            f"""
+            SELECT d.detected_at, d.product, d.span.field AS field, d.flagged, d.label, d.details,
+                   substr(CASE d.span.field WHEN 'prompt' THEN t.prompt ELSE t.response END, 1, 120) AS text
+            FROM {DETECTIONS} d
+            LEFT JOIN {TURNS} t ON t.span_id = d.span.span_id
+            WHERE d.detector = 'pii_ai_extract'
+            ORDER BY d.detected_at DESC
+            LIMIT {AI_EXTRACT_SAMPLE}
+            """
+        )
+    )
 else:
     print("Skipped (set run_ai_extract = true to run the ai_extract comparison).")
 
