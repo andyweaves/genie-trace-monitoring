@@ -8,5 +8,8 @@ targets:
     variables:
       warehouse_name: My SQL Warehouse     # existing SQL warehouse for the alerts
       workspace_url: https://my-workspace.cloud.databricks.com   # for links in alert notifications
-      # catalog: unity_gateway
+      # catalog: unity_gateway             # needs CREATE SCHEMA here
       # source_table: unity_gateway.unified_tracing.unity_gateway_otel_spans
+      # annotations_table: unity_gateway.unified_tracing.unity_gateway_otel_annotations
+      # genie_one_services: Genie One,data-rooms   # check 00_setup section 1 for the values in your table
+      # pii_allowlist_files: ${workspace.file_path}/src/config/pii_allowlist.yml,${workspace.file_path}/src/config/pii_allowlist_security.yml

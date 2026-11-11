@@ -16,5 +16,5 @@ resources:
 
       configuration:
         source_table: ${var.source_table}
-        genie_one_service: ${var.genie_one_service}
+        genie_one_services: ${var.genie_one_services}
         genie_code_service: ${var.genie_code_service}

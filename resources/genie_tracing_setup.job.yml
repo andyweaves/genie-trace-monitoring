@@ -1,0 +1,53 @@
+# One-time setup, run on demand after the first `bundle deploy`:
+#
+#   databricks bundle run genie_tracing_setup -t <target>
+#
+# Runs 00_setup (source check, detections table, spaCy wheel) then 01_deploy_prompt_guard with
+# parameters taken from the bundle variables, so neither notebook's widgets need editing by hand.
+# Safe to re-run: 00 is idempotent and 01 registers a new model version and updates the endpoint.
+resources:
+  jobs:
+    genie_tracing_setup:
+      name: "[${bundle.target}] genie_tracing_setup"
+      description: >
+        One-time setup for Genie trace monitoring: checks the source trace table, creates the
+        detections table, stages the spaCy wheel for Presidio, and deploys the Llama Prompt Guard 2
+        serving endpoint used by the prompt-injection detector.
+
+      environments:
+        - environment_key: base
+          spec:
+            environment_version: "4"
+
+      tasks:
+        - task_key: setup
+          environment_key: base
+          notebook_task:
+            notebook_path: ../src/notebooks/00_setup.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${resources.schemas.genie_tracing.name}
+              libs_volume: ${var.libs_volume}
+              source_table: ${var.source_table}
+              genie_one_services: ${var.genie_one_services}
+              genie_code_service: ${var.genie_code_service}
+              prompt_guard_endpoint: ${var.prompt_guard_endpoint}
+              lookback_days: ${var.detection_lookback_days}
+
+        # Downloads ~100 MB of model weights, logs a pyfunc to UC and waits for the endpoint to be
+        # ready, so it can take 20-40 minutes on the first run.
+        - task_key: deploy_prompt_guard
+          depends_on:
+            - task_key: setup
+          environment_key: base
+          timeout_seconds: 5400
+          notebook_task:
+            notebook_path: ../src/notebooks/01_deploy_prompt_guard.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${resources.schemas.genie_tracing.name}
+              endpoint_name: ${var.prompt_guard_endpoint}
+              model_source: ${var.prompt_guard_model_source}
+              source_uc_model: ${var.prompt_guard_source_uc_model}
+              hf_secret_scope: ${var.hf_secret_scope}
+              hf_secret_key: ${var.hf_secret_key}

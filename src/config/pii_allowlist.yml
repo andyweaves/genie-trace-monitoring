@@ -1,0 +1,47 @@
+# Terms that 02_detect_pii never treats as PII.
+#
+# Applies to the name-like entities from spaCy NER (PERSON, LOCATION, ORGANIZATION, NRP), which
+# mistake product, vendor and table names for people and places. A finding is dropped when any
+# term appears in it as a whole word, case-insensitively: `Contoso` also drops "Contoso Widget",
+# "the Contoso row" and "Contoso's". Pattern recognisers (cards, SSNs, emails, phones, ...) are
+# never allow-listed.
+#
+# More files can be layered on top with the `pii_allowlist_files` bundle variable (comma-separated
+# paths; see src/config/pii_allowlist_security.yml). Editing a file re-scans the lookback window
+# on the next run, so stale findings clear without re-triggering the alert for unchanged ones.
+terms:
+  # Databricks product names
+  - Databricks
+  - Delta
+  - Unity Catalog
+  - UC
+  - Spark
+  - PySpark
+  - Lakehouse
+  - Lakeflow
+  - Lakebase
+  - Genie
+  - Photon
+  - Iceberg
+  - Catalog Explorer
+  - Databricks Apps
+  - Databricks SQL
+  - Model Serving
+  - Vector Search
+  - Zerobus
+  - Mosaic AI
+  - Agent Bricks
+  - Preview
+  # Cloud platforms
+  - Azure
+  - AWS
+  - GCP
+  - Google Cloud
+  # Fictitious sample companies common in demo and test data
+  - Contoso
+  - Fabrikam
+  - Northwind
+  - Adventure Works
+  - Tailspin Toys
+  - Wide World Importers
+  - Woodgrove

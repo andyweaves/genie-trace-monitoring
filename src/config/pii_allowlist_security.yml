@@ -1,0 +1,45 @@
+# Optional allowlist layer for security and SOC workloads: tool, vendor, data-source and malware
+# names that spaCy NER labels as PERSON or LOCATION. Enable it by adding this file to the
+# `pii_allowlist_files` bundle variable, e.g. in databricks.local.yml:
+#
+#   pii_allowlist_files: ${workspace.file_path}/src/config/pii_allowlist.yml,${workspace.file_path}/src/config/pii_allowlist_security.yml
+terms:
+  # Vendors and products
+  - CrowdStrike
+  - Cisco
+  - Palo Alto
+  - Splunk
+  - Sentinel
+  - Defender
+  - Okta
+  - Zscaler
+  - Cloudflare
+  - Proofpoint
+  - SentinelOne
+  - Carbon Black
+  - Choria
+  # Open-source tools, feeds and formats
+  - Zeek
+  - Suricata
+  - Sysmon
+  - Sigma
+  - YARA
+  - MITRE
+  - ATT&CK
+  - OCSF
+  - ThreatFox
+  - URLhaus
+  - MalwareBazaar
+  - AlienVault
+  - OTX
+  - VirusTotal
+  - Observables
+  # Offensive tooling and techniques that read like names
+  - Mimikatz
+  - nanodump
+  - comsvcs
+  - MiniDump
+  - Cobalt Strike
+  - Rubeus
+  - BloodHound
+  - Impacket

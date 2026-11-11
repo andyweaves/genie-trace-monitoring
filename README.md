@@ -6,7 +6,8 @@ tables, runs PII, prompt-injection and guardrail-signal detections over them, ro
 up per session with a severity, and sends one alert listing the sessions worth reviewing.
 
 Everything is a [Databricks Asset Bundle](https://docs.databricks.com/dev-tools/bundles/):
-two serverless Lakeflow pipelines, one job, one SQL alert, seven notebooks, deployable to any
+two serverless Lakeflow pipelines, two jobs (one-time setup and hourly monitoring), one SQL alert,
+seven notebooks, deployable to any
 workspace with a single `databricks bundle deploy`.
 
 ## Contents
@@ -132,6 +133,7 @@ processing (`CREATE OR REFRESH STREAMING TABLE ... FROM STREAM(...)`).
 | Schema + volume | `resources/genie_tracing.schema.yml` | Target schema and wheel volume |
 | Pipeline `genie_tracing_etl` | `src/pipelines/etl/` | `genie_turns`, `genie_tool_calls` |
 | Pipeline `genie_tracing_sessions` | `src/pipelines/sessions/` | `genie_sessions`, `genie_session_timeline` |
+| Job `genie_tracing_setup` | `resources/genie_tracing_setup.job.yml` | One-time: `00_setup` → `01_deploy_prompt_guard`, parameterised from the bundle variables. Run on demand. |
 | Job `genie_tracing_monitoring` | `resources/genie_tracing_monitoring.job.yml` | ETL → 3 detection notebooks → sessions → alert task. Hourly, paused by default. |
 | SQL alert "sessions to review" | `resources/genie_tracing_alerts.alert.yml` | One digest across PII, prompt injection and guardrail signals: per session `severity`, `risk_score` and the top score per category. Evaluated by the job's alert task (its own schedule stays paused). Triggers only on sessions with a new finding since the previous run; the notification lists those first, then every session flagged in the last `alert_lookback_hours` for context (ids, labels, scores; never prompt text), with links to the tables to investigate. |
 
@@ -159,7 +161,8 @@ responses, SQL and tool results**, readable by anyone with `SELECT`.
 1. Unity Gateway enabled, **Enhanced Unity Gateway** preview on at the account level, the
    unified trace table set up by a metastore admin, and the **Genie One Tracing** / **Genie Code
    Tracing** previews on in each workspace you want to monitor. Nothing is backfilled.
-2. `SELECT` on the unified trace table and `CREATE` on the target catalog.
+2. `SELECT` on the unified trace table, and `USE CATALOG` + `CREATE SCHEMA` on the target catalog
+   (the `catalog` variable; it does not have to be the catalog holding the trace table).
 3. An existing **serverless or pro** SQL warehouse for the alert (set `warehouse_name`); job alert
    tasks do not run on classic warehouses.
 4. For `01_deploy_prompt_guard`, either a Prompt Guard 2 model already registered in Unity
@@ -167,7 +170,9 @@ responses, SQL and tool results**, readable by anyone with `SELECT`.
    Face token with access to Meta Llama models (`model_source = huggingface`, default scope
    `genie_tracing`, key `hf_token`).
 5. The spaCy model wheel in the libs volume (see `00_setup`). If GitHub egress is blocked from
-   your workspace, download `en_core_web_md-3.8.0-py3-none-any.whl` elsewhere and upload it.
+   your workspace, download `en_core_web_md-3.8.0-py3-none-any.whl` on your laptop and upload it
+   after the first deploy:
+   `databricks fs cp en_core_web_md-3.8.0-py3-none-any.whl dbfs:/Volumes/<catalog>/<schema>/genie_tracing_libs/wheels/ --profile <profile>`.
    The job's `detect_pii` task installs it as a dependency and fails until it is staged; the
    prompt-injection and guardrail tasks run in a separate environment and are unaffected. Run
    interactively, `02_detect_pii` falls back to Presidio's pattern recognisers without it.
@@ -186,11 +191,16 @@ databricks bundle validate -t dev
 databricks bundle deploy   -t dev
 
 # One-time, in the workspace:
-#   run src/notebooks/00_setup                 stages the spaCy wheel, creates genie_detections
-#   run src/notebooks/01_deploy_prompt_guard   deploys the Prompt Guard 2 endpoint
+# One-time: checks the source table, creates genie_detections, stages the spaCy wheel and
+# deploys the Prompt Guard 2 endpoint (20-40 minutes on the first run).
+databricks bundle run genie_tracing_setup -t dev
 
 databricks bundle run genie_tracing_monitoring -t dev
 ```
+
+The setup job passes the bundle variables to `00_setup` and `01_deploy_prompt_guard`, so there are
+no widgets to edit. Running either notebook by hand still works, but set its `catalog` / `schema`
+widgets first (they default to `unity_gateway` / `genie_tracing`).
 
 Then open `src/notebooks/06_table_guide` in the workspace and walk through the tables.
 
@@ -207,7 +217,10 @@ Variables you will most likely override (in `databricks.local.yml` or with `--va
 | `catalog` / `schema` | `unity_gateway` / `genie_tracing` | Where the derived tables live |
 | `source_table` | `unity_gateway.unified_tracing.unity_gateway_otel_spans` | Your unified trace table |
 | `annotations_table` | `..._otel_annotations` | Its feedback sibling |
-| `warehouse_name` | `Serverless Starter Warehouse` | Serverless or pro SQL warehouse for the alert |
+| `warehouse_name` | `Serverless Starter Warehouse` | Serverless or pro SQL warehouse for the alert. Looked up by exact name at deploy time, so it usually needs setting per workspace |
+| `genie_one_services` | `Genie One,data-rooms` | Comma-separated `service_name` values for Genie One spans (see [What the trace contains](#what-the-trace-does-and-does-not-contain)) |
+| `pii_allowlist_files` | `src/config/pii_allowlist.yml` | Comma-separated workspace paths of PII allowlist YAML files, merged (see [Tuning](#tuning)) |
+| `prompt_guard_model_source` | `huggingface` | How `genie_tracing_setup` gets the Prompt Guard weights: `huggingface` (secret `hf_secret_scope` / `hf_secret_key`, default `genie_tracing` / `hf_token`) or `uc_model` (`prompt_guard_source_uc_model`) |
 | `prompt_guard_endpoint` | `genie-prompt-guard-2` | Endpoint created by `01_deploy_prompt_guard` |
 | `detection_lookback_days` | `7` | How far back each run re-evaluates |
 | `alert_email` | deployer | Who gets alert notifications |
@@ -227,9 +240,13 @@ Variables you will most likely override (in `databricks.local.yml` or with `--va
 Guardrail rules, highest severity first: `guardrail_intervention` (classifier prefixes such as
 `Action denied:` and `Review suggested:`), `destructive_action_executed` ("I dropped …"),
 `tool_permission_denied`, `injection_recognised`, `refusal_text`, `boundary_pushing_prompt`,
-`tool_user_rejected`, `sensitive_arguments`, `destructive_confirmation_requested`,
-`external_destination`, plus informational `approval_requested`, `turn_error` and `tool_error`
-(recorded in `genie_detections`, but they do not flag the session or add to `risk_score`).
+`markdown_image_exfil_response` (the response contains a Markdown image that sends data to an
+outside host), `tool_user_rejected`, `sensitive_arguments`, `markdown_image_exfil` (a planted
+image of that kind in table data or tool output), `destructive_confirmation_requested`,
+`error_after_attack` (a turn that failed after a boundary-pushing prompt, a planted image or a
+prompt-injection hit), `external_destination`, plus informational `approval_requested`,
+`turn_error` and `tool_error` (recorded in `genie_detections`, but they do not flag the session or
+add to `risk_score`).
 
 PII findings are weighted by entity type (`pii_weights` on `02_detect_pii`): a finding's `score` is
 Presidio's confidence × the type's weight, and its `label` is the most severe entity.
@@ -252,9 +269,19 @@ Weights live in `src/pipelines/sessions/transformations/genie_sessions.sql`.
 ## Tuning
 
 * **Presidio**: `pii_threshold`, `ignore_entities` (default ignores `ORGANIZATION`, `DATE_TIME`,
-  `URL`, `NRP`, `UUID`) and `allowlist_terms` on `02_detect_pii`. The requester's own email is never
-  counted. NER entities are only accepted in prose fields, `PERSON` needs two words, `LOCATION`
-  needs three letters and mixed case. A date counts as `DATE_OF_BIRTH` only with birth wording
+  `URL`, `NRP`, `UUID`) on `02_detect_pii`. The requester's own email is never counted.
+* **PII allowlist**: terms that are never PII live in YAML files under `src/config/`
+  (`pii_allowlist.yml` ships with Databricks product names, cloud platforms and the usual sample
+  companies such as Contoso and Fabrikam). Layer more files with the `pii_allowlist_files` variable;
+  `pii_allowlist_security.yml` adds security vendors, tools and threat feeds (Zeek, ThreatFox,
+  CrowdStrike, ...) for SOC workloads. A name-like finding is dropped when it contains a term as a
+  whole word, so `Contoso` also covers "Contoso Widget". The scan configuration (merged allowlist,
+  `ignore_entities`, `pii_threshold` and the notebook's `NER_FILTER_VERSION`) is versioned: after a
+  change the next run re-scans the lookback window, clearing stale findings. A finding's
+  `detected_at` only moves when it appears or its score goes up, so re-scans never re-alert. `allowlist_terms` on the notebook adds inline terms for a quick
+  interactive test. NER entities are only accepted in prose fields, `PERSON` needs two words, `LOCATION`
+  needs three letters and mixed case, and a one-word `LOCATION` that is all lowercase or cased like
+  an identifier (`dbo`, `PySpark`, `HTTPError`) is dropped. A date counts as `DATE_OF_BIRTH` only with birth wording
   (`DOB`, `date of birth`, `born`, `birthday`, ...) right next to it, a year at least 10 years ago,
   and outside tool arguments (where `WHERE dob > '1990-01-01'` is a filter, not a birth date).
 * **PII severity**: `pii_weights` (JSON) and `pii_default_weight` on `02_detect_pii`. Every run
@@ -263,8 +290,9 @@ Weights live in `src/pipelines/sessions/transformations/genie_sessions.sql`.
   22M model catches direct jailbreak phrasing reliably but scored a table-embedded
   "SYSTEM: … DROP TABLE" row as benign in testing. Keep the `ai_classify` second opinion on, or
   deploy the 86M variant, for indirect injection.
-* **Guardrail wording**: extend `INTERVENTION_PATTERNS`, `REFUSAL_PATTERNS`, `CONFIRMATION_REGEX`
-  and `DESTRUCTIVE_EXECUTED_REGEX` in `04_detect_guardrail_signals` as you see new phrasing. The
+* **Guardrail wording**: extend `INTERVENTION_PATTERNS`, `REFUSAL_PATTERNS`, `BOUNDARY_PROMPT_REGEX`,
+  `MARKDOWN_EXFIL_REGEX`, `CONFIRMATION_REGEX` and `DESTRUCTIVE_EXECUTED_REGEX` in
+  `04_detect_guardrail_signals` as you see new phrasing. The
   last cell of that notebook lists recent non-success turns to mine for it.
 * **Scan scope**: a model-call output identical to the turn's final response is scanned once, as
   the response. Guardrail rules re-score their lookback window on every run in a single MERGE:
@@ -354,14 +382,20 @@ Verified against live traces in November 2026. These shape what the detectors ca
   text the Genie Code safety and Auto-approve classifiers produce is returned to the model as a
   tool result, but that tool call is not exported as a span.
 * **Genie Code exports a filtered subset of spans** (`expected_span_count` < `source_span_count`
-  on the root span). Asset create / edit / run and user questions are exported; **SQL execution is
+  on the root span). Asset create / edit / run and user questions are exported. Newer traces also
+  carry `execute_tool executeCode` spans with the SQL or Python in `tool_arguments` and a status in
+  `tool_result`; on traces without them, **SQL execution is
   not**. A successful `DROP TABLE` therefore leaves no tool span, only the response text
   "I dropped …". `destructive_action_executed` exists for exactly this reason.
 * **What survives is the final response the user saw**, which usually narrates the outcome
   ("The safety guardrails prevented me from executing it"). The guardrail-signal detector keys
   off that text. It will get sharper the day verdicts arrive as span events.
 * The unified trace table is shared with AI Gateway model traffic; everything here filters on
-  `service_name IN ('Genie One', 'genie-code-agent')`.
+  `service_name`: `genie-code-agent` for Genie Code, and the `genie_one_services` list for Genie One.
+  Genie One shows up under more than one value: `Genie One` for the web and desktop app, and
+  `data-rooms` for conversations started through the API or CLI (`databricks.genie.channel =
+  databricks_cli`), with the same span shape. Check `00_setup` section 1 for the values in your
+  table and extend the list if a new one appears; spans under an unlisted name are silently skipped.
 * Span names differ from the docs: Genie Code tool spans are `execute_tool <name>` (not
   `tool.execute:<name>`), user questions are `execute_tool askUserQuestions` with a result of
   `answered` or `declined`, and the Genie One root span is `invoke_agent GenieOne` (not
@@ -399,11 +433,13 @@ Verified against live traces in November 2026. These shape what the detectors ca
 │   ├── genie_tracing.schema.yml       schema + wheel volume
 │   ├── genie_tracing_etl.pipeline.yml
 │   ├── genie_tracing_sessions.pipeline.yml
+│   ├── genie_tracing_setup.job.yml     one-time setup: 00_setup → 01_deploy_prompt_guard
 │   ├── genie_tracing_monitoring.job.yml
 │   └── genie_tracing_alerts.alert.yml "sessions to review" alert
 ├── src/
 │   ├── pipelines/etl/transformations/        genie_turns.sql, genie_tool_calls.sql
 │   ├── pipelines/sessions/transformations/   genie_sessions.sql, genie_session_timeline.sql
+│   ├── config/                               PII allowlist YAML (base + security layer)
 │   ├── notebooks/                            00 … 06 + _detection_utils, images/
 │   └── sql/access_control.sql
 └── docs/

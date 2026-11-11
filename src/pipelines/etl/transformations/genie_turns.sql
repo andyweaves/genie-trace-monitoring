@@ -26,7 +26,8 @@ AS
 WITH roots AS (
   SELECT *
   FROM ${source_table}
-  WHERE service_name IN ('${genie_one_service}', '${genie_code_service}')
+  WHERE (service_name = '${genie_code_service}'
+         OR array_contains(transform(split('${genie_one_services}', ','), s -> trim(s)), service_name))
     AND (parent_span_id IS NULL OR parent_span_id = '')
 ),
 typed AS (

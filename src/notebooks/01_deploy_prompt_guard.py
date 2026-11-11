@@ -291,7 +291,7 @@ display(pd.concat([tests["text"].str.slice(0, 80), result], axis=1))
 from datetime import timedelta
 
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.serving import EndpointCoreConfigInput, ServedEntityInput
+from databricks.sdk.service.serving import EndpointCoreConfigInput, ServedEntityInput, ServingModelWorkloadType
 
 ws = WorkspaceClient()
 
@@ -299,7 +299,7 @@ served_entity = ServedEntityInput(
     name="prompt_guard",
     entity_name=REGISTERED_MODEL,
     entity_version=model_info.registered_model_version,
-    workload_type="CPU",
+    workload_type=ServingModelWorkloadType.CPU,  # an enum: newer SDKs reject the plain string
     workload_size="Small",
     scale_to_zero_enabled=True,
 )

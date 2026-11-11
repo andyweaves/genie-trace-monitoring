@@ -130,14 +130,19 @@ def text_fields(lookback_days: int = LOOKBACK_DAYS):
     return spark.sql(sql)
 
 
-def candidates(detector: str, fields=None, lookback_days: int = LOOKBACK_DAYS):
-    """Text fields not yet scanned by `detector`."""
+def candidates(detector: str, fields=None, lookback_days: int = LOOKBACK_DAYS, rescan_where: str = None):
+    """Text fields not yet scanned by `detector`.
+
+    rescan_where: optional SQL predicate over genie_detections rows; matching rows count as not
+    scanned, so their fields are scanned again (e.g. after a configuration change).
+    """
     df = text_fields(lookback_days)
     if fields:
         df = df.where(df.field.isin(list(fields)))
+    done = f"detector = '{detector}'" + (f" AND NOT coalesce({rescan_where}, false)" if rescan_where else "")
     scanned = (
         spark.table(DETECTIONS)
-        .where(f"detector = '{detector}'")
+        .where(done)
         .select(F.col("span.span_id").alias("span_id"), F.col("span.field").alias("field"))
         .distinct()
     )
@@ -156,8 +161,9 @@ def candidates(detector: str, fields=None, lookback_days: int = LOOKBACK_DAYS):
 # MAGIC   counts read from it, so a UDF or billed AI Function behind `df` runs exactly once.
 # MAGIC * **Errors are retried.** Rows with a non-null `error` are not written, so the field is still a
 # MAGIC   candidate on the next run (until it ages out of the lookback window).
-# MAGIC * **Stable `detected_at`.** An existing row keeps its `detected_at` unless its verdict (`flagged`
-# MAGIC   or `score`) changed, so alerts keyed on `detected_at` fire once per finding.
+# MAGIC * **Stable `detected_at`.** An existing row keeps its `detected_at` unless it became flagged or
+# MAGIC   its score went up, so alerts keyed on `detected_at` fire once per finding and not again when
+# MAGIC   a re-scan (e.g. after an allowlist edit) makes it less severe.
 # MAGIC * **Window re-scoring.** With `rescore_since`, this detector's rows from that time on that are no
 # MAGIC   longer produced are deleted in the same MERGE (used by the guardrail rules).
 
@@ -221,8 +227,9 @@ def write_detections(df, detector: str, rescore_since: str = None) -> int:
           ON d.detection_id = s.detection_id
           WHEN MATCHED THEN UPDATE SET
             {update_set},
-            detected_at = CASE WHEN d.flagged <=> s.flagged AND d.score <=> s.score
-                               THEN d.detected_at ELSE s.detected_at END
+            -- Only a finding that appeared or got worse counts as new to the alert.
+            detected_at = CASE WHEN s.flagged AND (NOT coalesce(d.flagged, false) OR s.score > coalesce(d.score, 0))
+                               THEN s.detected_at ELSE d.detected_at END
           WHEN NOT MATCHED THEN INSERT *
           {delete_clause}
         """)
