@@ -27,7 +27,7 @@ dbutils.widgets.text("libs_volume", "genie_tracing_libs", "Libraries volume")
 dbutils.widgets.text("source_table", "unity_gateway.unified_tracing.unity_gateway_otel_spans", "Unified trace table")
 dbutils.widgets.text("spacy_model", "en_core_web_md", "spaCy model")
 dbutils.widgets.text("spacy_version", "3.8.0", "spaCy model version")
-dbutils.widgets.text("genie_one_service", "Genie One", "Genie One service_name")
+dbutils.widgets.text("genie_one_services", "Genie One,data-rooms", "Genie One service_name values (comma-separated)")
 dbutils.widgets.text("genie_code_service", "genie-code-agent", "Genie Code service_name")
 
 CATALOG = dbutils.widgets.get("catalog")
@@ -36,8 +36,9 @@ LIBS_VOLUME = dbutils.widgets.get("libs_volume")
 SOURCE_TABLE = dbutils.widgets.get("source_table")
 SPACY_MODEL = dbutils.widgets.get("spacy_model")
 SPACY_VERSION = dbutils.widgets.get("spacy_version")
-GENIE_ONE_SERVICE = dbutils.widgets.get("genie_one_service")
+GENIE_ONE_SERVICES = [s.strip() for s in dbutils.widgets.get("genie_one_services").split(",") if s.strip()]
 GENIE_CODE_SERVICE = dbutils.widgets.get("genie_code_service")
+GENIE_SERVICES_SQL = ", ".join("'" + s.replace("'", "''") + "'" for s in [*GENIE_ONE_SERVICES, GENIE_CODE_SERVICE])
 
 FQ = f"`{CATALOG}`.`{SCHEMA}`"
 VOLUME_PATH = f"/Volumes/{CATALOG}/{SCHEMA}/{LIBS_VOLUME}"
@@ -64,7 +65,7 @@ display(
                COUNT(DISTINCT trace_id)   AS traces,
                MIN(time)                  AS first_seen,
                MAX(time)                  AS last_seen,
-               CASE WHEN service_name IN ('{GENIE_ONE_SERVICE}', '{GENIE_CODE_SERVICE}') THEN 'Genie' ELSE 'other AI Gateway traffic' END AS category
+               CASE WHEN service_name IN ({GENIE_SERVICES_SQL}) THEN 'Genie' ELSE 'other AI Gateway traffic' END AS category
         FROM {SOURCE_TABLE}
         GROUP BY service_name
         ORDER BY category, spans DESC

@@ -23,6 +23,8 @@ resources:
           default: ${var.prompt_guard_endpoint}
         - name: lookback_days
           default: ${var.detection_lookback_days}
+        - name: pii_allowlist_files
+          default: ${var.pii_allowlist_files}
 
       environments:
         # PII task only: Presidio + spaCy and the model wheel staged by 00_setup. Kept separate so a
@@ -34,6 +36,7 @@ resources:
               - presidio-analyzer>=2.2,<3
               - presidio-anonymizer>=2.2,<3
               - spacy>=3.8,<3.9
+              - pyyaml>=6
               # spaCy English model staged in the libs volume by 00_setup.
               - /Volumes/${var.catalog}/${var.schema}/${var.libs_volume}/wheels/en_core_web_md-3.8.0-py3-none-any.whl
         # Prompt-injection and guardrail tasks: no extra libraries needed.

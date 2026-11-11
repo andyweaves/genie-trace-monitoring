@@ -20,7 +20,8 @@ AS
 WITH children AS (
   SELECT *
   FROM ${source_table}
-  WHERE service_name IN ('${genie_one_service}', '${genie_code_service}')
+  WHERE (service_name = '${genie_code_service}'
+         OR array_contains(transform(split('${genie_one_services}', ','), s -> trim(s)), service_name))
     AND parent_span_id IS NOT NULL AND parent_span_id <> ''
 ),
 roots AS (
@@ -29,7 +30,8 @@ roots AS (
     attributes:['gen_ai.conversation.id']::string AS conversation_id,
     attributes:['databricks.genie.channel']::string AS channel
   FROM ${source_table}
-  WHERE service_name IN ('${genie_one_service}', '${genie_code_service}')
+  WHERE (service_name = '${genie_code_service}'
+         OR array_contains(transform(split('${genie_one_services}', ','), s -> trim(s)), service_name))
     AND (parent_span_id IS NULL OR parent_span_id = '')
 ),
 typed AS (
@@ -106,7 +108,8 @@ SELECT
 
   -- Headline outcome
   status_code = 'STATUS_CODE_ERROR'                                  AS is_error,
-  coalesce(tool_outcome IN ('USER_REJECTED', 'PERMISSION_DENIED'), false) AS is_rejected_or_denied,
+  -- POLICY_BLOCKED: the Genie Code guardrail stopped the call
+  coalesce(tool_outcome IN ('USER_REJECTED', 'PERMISSION_DENIED', 'POLICY_BLOCKED'), false) AS is_rejected_or_denied,
 
   -- Detail, grouped
   named_struct(

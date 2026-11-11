@@ -52,12 +52,16 @@ dbutils.widgets.text("conversation_id", "", "Conversation id (blank = highest-ri
 dbutils.widgets.text("days", "30", "Lookback days")
 dbutils.widgets.text("source_table", "unity_gateway.unified_tracing.unity_gateway_otel_spans", "Raw spans table")
 dbutils.widgets.text("annotations_table", "unity_gateway.unified_tracing.unity_gateway_otel_annotations", "Raw annotations table")
+dbutils.widgets.text("genie_services", "Genie One,data-rooms,genie-code-agent", "Genie service_name values (comma-separated)")
 
 CATALOG = dbutils.widgets.get("catalog")
 SCHEMA = dbutils.widgets.get("schema")
 DAYS = int(dbutils.widgets.get("days"))
 SOURCE_TABLE = dbutils.widgets.get("source_table")
 ANNOTATIONS_TABLE = dbutils.widgets.get("annotations_table")
+GENIE_SERVICES_SQL = ", ".join(
+    "'" + s.strip().replace("'", "''") + "'" for s in dbutils.widgets.get("genie_services").split(",") if s.strip()
+)
 FQ = f"`{CATALOG}`.`{SCHEMA}`"
 
 conversation_id = dbutils.widgets.get("conversation_id").strip()
@@ -437,7 +441,7 @@ ORDER BY table_name, column_name, tag_name
 
 q(f"""
 SELECT service_name,
-       CASE WHEN service_name IN ('Genie One', 'genie-code-agent') THEN 'Genie' ELSE 'AI Gateway model traffic' END AS category,
+       CASE WHEN service_name IN ({GENIE_SERVICES_SQL}) THEN 'Genie' ELSE 'AI Gateway model traffic' END AS category,
        COUNT(*)                 AS spans,
        COUNT(DISTINCT trace_id) AS traces,
        MIN(time)                AS first_seen,
@@ -511,7 +515,7 @@ LIMIT 100
 # MAGIC | Need | Go to |
 # MAGIC |---|---|
 # MAGIC | Be told when something is flagged | The "sessions to review" alert in `resources/genie_tracing_alerts.alert.yml`, evaluated at the end of every job run |
-# MAGIC | Tune what counts as PII, and how bad it is | `02_detect_pii`: `pii_threshold`, `ignore_entities`, `allowlist_terms`, `pii_weights` |
+# MAGIC | Tune what counts as PII, and how bad it is | `02_detect_pii`: `pii_threshold`, `ignore_entities`, `pii_weights`; allowlist in `src/config/pii_allowlist*.yml` |
 # MAGIC | Tune prompt-injection sensitivity | `03_detect_prompt_injection`: `prompt_guard_threshold`, `run_ai_classify` |
 # MAGIC | Add guardrail wording you have seen | `04_detect_guardrail_signals`: `INTERVENTION_PATTERNS`, `REFUSAL_PATTERNS` |
 # MAGIC | Change the risk formula | `src/pipelines/sessions/transformations/genie_sessions.sql` |

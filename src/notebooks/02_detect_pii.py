@@ -45,7 +45,8 @@ DEFAULT_PII_WEIGHTS = {
 dbutils.widgets.text("spacy_model", "en_core_web_md", "spaCy model")
 dbutils.widgets.text("pii_threshold", "0.5", "Presidio score threshold")
 dbutils.widgets.text("ignore_entities", "DATE_TIME,URL,NRP,ORGANIZATION,UUID", "Presidio entity types to ignore")
-dbutils.widgets.text("allowlist_terms", "Delta,Databricks,Unity Catalog,Spark,Lakehouse,Genie,Photon,Iceberg,Lakebase,UC,Catalog Explorer,Databricks Apps,Databricks SQL,Model Serving,Vector Search", "Terms never treated as PII")
+dbutils.widgets.text("pii_allowlist_files", "../config/pii_allowlist.yml", "Allowlist YAML files (comma-separated)")
+dbutils.widgets.text("allowlist_terms", "", "Extra allowlist terms (comma-separated)")
 dbutils.widgets.dropdown("run_ai_extract", "false", ["false", "true"], "Run ai_extract comparison")
 dbutils.widgets.text("ai_extract_sample", "25", "ai_extract sample rows")
 dbutils.widgets.dropdown("apply_governed_tags", "true", ["false", "true"], "Apply class.* tags to columns")
@@ -55,12 +56,51 @@ dbutils.widgets.text("pii_default_weight", "0.5", "Weight for entity types not l
 SPACY_MODEL = dbutils.widgets.get("spacy_model")
 PII_THRESHOLD = float(dbutils.widgets.get("pii_threshold"))
 IGNORE_ENTITIES = [e.strip() for e in dbutils.widgets.get("ignore_entities").split(",") if e.strip()]
-ALLOWLIST_TERMS = [t.strip().lower() for t in dbutils.widgets.get("allowlist_terms").split(",") if t.strip()]
 RUN_AI_EXTRACT = dbutils.widgets.get("run_ai_extract") == "true"
 AI_EXTRACT_SAMPLE = int(dbutils.widgets.get("ai_extract_sample"))
 APPLY_GOVERNED_TAGS = dbutils.widgets.get("apply_governed_tags") == "true"
 PII_WEIGHTS = {k: float(v) for k, v in json.loads(dbutils.widgets.get("pii_weights")).items()}
 PII_DEFAULT_WEIGHT = float(dbutils.widgets.get("pii_default_weight"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Allowlist
+# MAGIC
+# MAGIC Terms come from the YAML files in `pii_allowlist_files` (`src/config/` in the bundle; relative
+# MAGIC paths resolve against this notebook's folder) plus any inline `allowlist_terms`. Each file holds
+# MAGIC a `terms:` list. The merged list, `ignore_entities`, `pii_threshold` and `NER_FILTER_VERSION`
+# MAGIC (bump it when changing the filtering code) are hashed into `SCAN_VERSION` and stored with every
+# MAGIC finding; fields scanned under a different version are re-scanned, so a config change clears
+# MAGIC stale findings across the lookback window.
+
+# COMMAND ----------
+
+import hashlib
+import os
+
+import yaml
+
+
+def load_allowlist(paths: str, inline: str) -> list:
+    terms = []
+    for path in [p.strip() for p in paths.split(",") if p.strip()]:
+        resolved = path if os.path.isabs(path) else os.path.abspath(path)
+        with open(resolved) as f:
+            doc = yaml.safe_load(f) or {}
+        loaded = [str(t).strip() for t in (doc.get("terms") or []) if str(t).strip()]
+        print(f"allowlist: {len(loaded):3d} terms from {resolved}")
+        terms += loaded
+    terms += [t.strip() for t in inline.split(",") if t.strip()]
+    return sorted({t.lower() for t in terms})
+
+
+ALLOWLIST_TERMS = load_allowlist(dbutils.widgets.get("pii_allowlist_files"), dbutils.widgets.get("allowlist_terms"))
+# Bump when the entity filtering in make_presidio_udf changes, so history is re-scanned.
+NER_FILTER_VERSION = "2"
+SCAN_VERSION = hashlib.sha256(json.dumps(
+    [ALLOWLIST_TERMS, sorted(IGNORE_ENTITIES), PII_THRESHOLD, NER_FILTER_VERSION]).encode()).hexdigest()[:12]
+print(f"allowlist: {len(ALLOWLIST_TERMS)} distinct terms; scan version {SCAN_VERSION}")
 
 # COMMAND ----------
 
@@ -75,7 +115,7 @@ PII_DEFAULT_WEIGHT = float(dbutils.widgets.get("pii_default_weight"))
 # MAGIC Matches equal to the requester's own user name are dropped: Genie Code tool arguments
 # MAGIC routinely contain the user's workspace path, and that is not a leak. `ORGANIZATION`,
 # MAGIC `DATE_TIME`, `URL` and `NRP` are ignored by default: product and vendor names are not PII
-# MAGIC and dominate Genie traffic. NER matches on allow-listed product terms (`allowlist_terms`) and
+# MAGIC and dominate Genie traffic. NER matches containing an allow-listed term (`src/config/pii_allowlist*.yml`) and
 # MAGIC on locale codes such as `en_GB` are dropped too; spaCy labels both as LOCATION.
 # MAGIC
 # MAGIC **Dates of birth.** Presidio has no date-of-birth recogniser, and its generic `DATE_TIME` is
@@ -156,14 +196,20 @@ LOCALE_RE = re.compile(r"^[a-z]{2,3}[_-][A-Z]{2}$")
 IDENTIFIER_RE = re.compile(r"^[`'\"]?[A-Za-z0-9]+(?:[_.][A-Za-z0-9]+)+[`'\"]?$")
 # Prose-like token: letters, spaces, hyphens, apostrophes only (no digits, code punctuation)
 PROSE_RE = re.compile(r"^[A-Za-z][A-Za-z' -]*[A-Za-z]$")
+# Identifier-style casing inside one word: PySpark, iamRole (lower->upper), HTTPError (UPPER->Upper).
+IDENT_CASE_RE = re.compile(r"[a-z][A-Z]|[A-Z]{2}[a-z]")
 # NER entities (PERSON, LOCATION) only count in fields users type or read as prose.
 NER_FIELDS = {"prompt", "response"}
 NER_ENTITIES = {"PERSON", "LOCATION", "ORGANIZATION", "NRP"}
 
 
-def make_presidio_udf(spacy_model: str, threshold: float, ignore: list, allowlist: list):
+def make_presidio_udf(spacy_model: str, threshold: float, ignore: list, allowlist: list, scan_version: str):
     ignore_set = set(ignore)
-    allow_set = set(allowlist)
+    # Whole-word, case-insensitive: "contoso" also matches "Contoso Widget" and "Contoso's".
+    allow_re = (
+        re.compile(r"(?<!\w)(?:" + "|".join(re.escape(t) for t in sorted(allowlist, key=len, reverse=True)) + r")(?!\w)", re.I)
+        if allowlist else None
+    )
 
     @pandas_udf(PRESIDIO_SCHEMA)
     def presidio_scan(texts: pd.Series, requesters: pd.Series, fields: pd.Series) -> pd.DataFrame:
@@ -199,7 +245,7 @@ def make_presidio_udf(spacy_model: str, threshold: float, ignore: list, allowlis
                     token = snippet.strip()
                     if field not in NER_FIELDS:
                         continue  # SQL, JSON and markdown tables: NER is noise here
-                    if token.lower() in allow_set or LOCALE_RE.match(token) or IDENTIFIER_RE.match(token):
+                    if (allow_re and allow_re.search(token)) or LOCALE_RE.match(token) or IDENTIFIER_RE.match(token):
                         continue
                     if not PROSE_RE.match(token):
                         continue
@@ -207,6 +253,8 @@ def make_presidio_udf(spacy_model: str, threshold: float, ignore: list, allowlis
                         continue  # single-token "names" are overwhelmingly column or product names
                     if r.entity_type == "LOCATION" and (len(token) < 3 or token.isupper()):
                         continue  # country / region codes (US, GB, EMEA) are not personal data
+                    if r.entity_type == "LOCATION" and " " not in token and (token.islower() or IDENT_CASE_RE.search(token)):
+                        continue  # one-word identifiers: dbo, PySpark, HTTPError, iamRole
                 kept.append({"type": r.entity_type, "score": round(float(r.score), 3), "start": r.start, "end": r.end})
             types = sorted({k["type"] for k in kept})
             top = max(kept, key=lambda k: k["score"]) if kept else None
@@ -216,7 +264,8 @@ def make_presidio_udf(spacy_model: str, threshold: float, ignore: list, allowlis
                 "label": top["type"] if top else None,
                 "entity_types": types,
                 "entity_count": len(kept),
-                "details": json.dumps({"entities": kept[:50], "truncated": len(kept) > 50}),
+                "details": json.dumps({"entities": kept[:50], "truncated": len(kept) > 50,
+                                       "scan_version": scan_version}),
                 "error": None,
             })
         return pd.DataFrame(rows)
@@ -224,11 +273,28 @@ def make_presidio_udf(spacy_model: str, threshold: float, ignore: list, allowlis
     return presidio_scan
 
 
-presidio_scan = make_presidio_udf(SPACY_MODEL, PII_THRESHOLD, IGNORE_ENTITIES, ALLOWLIST_TERMS)
+presidio_scan = make_presidio_udf(SPACY_MODEL, PII_THRESHOLD, IGNORE_ENTITIES, ALLOWLIST_TERMS, SCAN_VERSION)
 
 # COMMAND ----------
 
-pii_candidates = candidates("pii_presidio")
+# Entity-type weighting (pii_weights), shared by the scan below and the re-weighting in 1b.
+def sql_weight_map(weights: dict) -> str:
+    return "map(" + ", ".join(f"'{k}', CAST({float(v)} AS DOUBLE)" for k, v in sorted(weights.items())) + ")"
+
+
+PII_ENTITIES_SQL = "from_json(details:entities, 'ARRAY<STRUCT<type: STRING, score: DOUBLE>>')"
+# Ascending sort on (severity, type); the last element is the most severe entity.
+PII_RANKED_SQL = (
+    f"array_sort(transform({PII_ENTITIES_SQL}, e -> named_struct("
+    f"'severity', round(e.score * coalesce(try_element_at({sql_weight_map(PII_WEIGHTS)}, e.type), "
+    f"CAST({PII_DEFAULT_WEIGHT} AS DOUBLE)), 3), 'type', e.type)))"
+)
+
+# Fields scanned under a different configuration (allowlist, threshold, filters) are scanned again.
+pii_candidates = candidates(
+    "pii_presidio",
+    rescan_where=f"coalesce(details:scan_version::string, '') <> '{SCAN_VERSION}'",
+)
 print(f"Fields to scan with Presidio: {pii_candidates.count()}")
 
 scanned = (
@@ -236,6 +302,10 @@ scanned = (
     .withColumn("r", presidio_scan(F.col("text"), F.col("requester"), F.col("field")))
     .select("*", "r.flagged", "r.score", "r.label", "r.details", "r.error")
     .drop("r")
+    # Weight before writing (as section 1b does for history), so a re-scan that finds the same
+    # entities leaves score and detected_at unchanged and does not re-trigger the alert.
+    .withColumn("score", F.when(F.col("flagged"), F.expr(f"element_at({PII_RANKED_SQL}, -1).severity")).otherwise(F.col("score")))
+    .withColumn("label", F.when(F.col("flagged"), F.expr(f"element_at({PII_RANKED_SQL}, -1).type")).otherwise(F.col("label")))
 )
 write_detections(scanned, "pii_presidio")
 
@@ -250,19 +320,6 @@ write_detections(scanned, "pii_presidio")
 # MAGIC `detected_at` is not touched, so re-weighting never re-triggers alerts.
 
 # COMMAND ----------
-
-
-def sql_weight_map(weights: dict) -> str:
-    return "map(" + ", ".join(f"'{k}', CAST({float(v)} AS DOUBLE)" for k, v in sorted(weights.items())) + ")"
-
-
-PII_ENTITIES_SQL = "from_json(details:entities, 'ARRAY<STRUCT<type: STRING, score: DOUBLE>>')"
-# Ascending sort on (severity, type); the last element is the most severe entity.
-PII_RANKED_SQL = (
-    f"array_sort(transform({PII_ENTITIES_SQL}, e -> named_struct("
-    f"'severity', round(e.score * coalesce(try_element_at({sql_weight_map(PII_WEIGHTS)}, e.type), "
-    f"CAST({PII_DEFAULT_WEIGHT} AS DOUBLE)), 3), 'type', e.type)))"
-)
 
 spark.sql(f"""
   UPDATE {DETECTIONS}

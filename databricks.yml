@@ -24,15 +24,37 @@ variables:
     description: Fully qualified name of the unified trace annotations table (thumbs up/down).
     default: unity_gateway.unified_tracing.unity_gateway_otel_annotations
 
-  # service_name values used by Genie products in the trace table.
-  genie_one_service:
-    default: Genie One
+  # service_name values used by Genie products in the trace table. Genie One appears under more
+  # than one: `Genie One` for the web / desktop app, `data-rooms` for API and CLI conversations.
+  genie_one_services:
+    description: Comma-separated service_name values for Genie One spans.
+    default: Genie One,data-rooms
   genie_code_service:
     default: genie-code-agent
 
   # Model serving endpoint hosting Llama Prompt Guard 2 (deployed by 01_deploy_prompt_guard).
   prompt_guard_endpoint:
     default: genie-prompt-guard-2
+
+  # How 01_deploy_prompt_guard gets the model weights (run by the genie_tracing_setup job):
+  # `huggingface` needs a secret with a Hugging Face token that has Meta Llama access;
+  # `uc_model` copies them from a Prompt Guard 2 model already registered in Unity Catalog.
+  prompt_guard_model_source:
+    default: huggingface
+  prompt_guard_source_uc_model:
+    description: Registered model to copy weights from when prompt_guard_model_source = uc_model.
+    default: main.default.llama_prompt_guard_2
+  hf_secret_scope:
+    default: genie_tracing
+  hf_secret_key:
+    default: hf_token
+
+  # PII allowlist: YAML files of terms 02_detect_pii never treats as PII (see src/config/).
+  pii_allowlist_files:
+    description: >
+      Comma-separated workspace paths of allowlist YAML files, merged in order. Add
+      src/config/pii_allowlist_security.yml for SOC / security workloads, or your own file.
+    default: ${workspace.file_path}/src/config/pii_allowlist.yml
 
   # Volume used to stage wheels (spaCy model for Presidio).
   libs_volume:
@@ -44,7 +66,9 @@ variables:
 
   # SQL warehouse used by alerts, resolved by name at deploy time.
   warehouse_name:
-    description: Name of an existing SQL warehouse to run the alerts on.
+    description: >
+      Name of an existing serverless or pro SQL warehouse to run the alert on. The lookup fails at
+      deploy time if no warehouse has this exact name, so set it per workspace.
     default: Serverless Starter Warehouse
   warehouse_id:
     description: SQL warehouse ID for alerts (looked up from warehouse_name).
