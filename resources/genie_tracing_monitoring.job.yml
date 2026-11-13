@@ -25,6 +25,8 @@ resources:
           default: ${var.detection_lookback_days}
         - name: pii_allowlist_files
           default: ${var.pii_allowlist_files}
+        - name: security_patterns_file
+          default: ${var.security_patterns_file}
 
       environments:
         # PII task only: Presidio + spaCy and the model wheel staged by 00_setup. Kept separate so a
@@ -39,10 +41,12 @@ resources:
               - pyyaml>=6
               # spaCy English model staged in the libs volume by 00_setup.
               - /Volumes/${var.catalog}/${var.schema}/${var.libs_volume}/wheels/en_core_web_md-3.8.0-py3-none-any.whl
-        # Prompt-injection and guardrail tasks: no extra libraries needed.
+        # Guardrail patterns are loaded on the driver; worker-side matching uses only stdlib.
         - environment_key: base
           spec:
             environment_version: "4"
+            dependencies:
+              - pyyaml>=6
 
       tasks:
         - task_key: etl_pipeline

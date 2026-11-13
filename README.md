@@ -145,10 +145,11 @@ processing (`CREATE OR REFRESH STREAMING TABLE ... FROM STREAM(...)`).
 | `01_deploy_prompt_guard.py` | Get Llama Prompt Guard 2 weights (from Hugging Face, or copied out of a Prompt Guard model already registered in UC), log a batch-scoring pyfunc with 512-token chunking, deploy endpoint `genie-prompt-guard-2` |
 | `02_detect_pii.py` | Presidio pandas UDF (row-level) with a context-gated `DATE_OF_BIRTH` recogniser, severity weighting by entity type (re-applied to history every run), optional `ai_extract` comparison, Data Classification results, apply governed `class.*` tags |
 | `03_detect_prompt_injection.py` | `ai_query` to Prompt Guard over prompts and tool results, `ai_classify` second opinion, disagreement review |
-| `04_detect_guardrail_signals.py` | Rule-based signals over outcomes and text; query to discover the guardrail's own wording |
+| `04_detect_guardrail_signals.py` | Outcome/wording rules, deterministic security signatures with bounded decoding, and repeated-call / long-turn checks; no new AI calls |
 | `05_session_explorer.py` | Adoption, flagged sessions, session walkthrough, approval flows, tool usage, thumbs-down |
 | `06_table_guide.py` | Guided tour of every table in triage order, with a brief and a runnable query per table. **Start here if you are new to the schema.** |
 | `_detection_utils.py` | Shared config, `genie_detections` DDL, candidate selection, idempotent MERGE into `genie_detections` (scored once via a staging table; errored rows skipped for retry) |
+| `_security_pattern_utils.py` | Pure-Python deterministic matcher, validated YAML configuration and resource-bounded passive decoding; independently unit tested |
 
 `src/sql/access_control.sql` has grants, a workspace row filter, column masks and an ABAC
 policy sketch. Apply them before widening access: **the derived tables contain full prompts,
@@ -220,6 +221,7 @@ Variables you will most likely override (in `databricks.local.yml` or with `--va
 | `warehouse_name` | `Serverless Starter Warehouse` | Serverless or pro SQL warehouse for the alert. Looked up by exact name at deploy time, so it usually needs setting per workspace |
 | `genie_one_services` | `Genie One,data-rooms` | Comma-separated `service_name` values for Genie One spans (see [What the trace contains](#what-the-trace-does-and-does-not-contain)) |
 | `pii_allowlist_files` | `src/config/pii_allowlist.yml` | Comma-separated workspace paths of PII allowlist YAML files, merged (see [Tuning](#tuning)) |
+| `security_patterns_file` | `src/config/security_patterns.yml` | Workspace path of deterministic security signatures, scan limits, and optional runaway thresholds |
 | `prompt_guard_model_source` | `huggingface` | How `genie_tracing_setup` gets the Prompt Guard weights: `huggingface` (secret `hf_secret_scope` / `hf_secret_key`, default `genie_tracing` / `hf_token`) or `uc_model` (`prompt_guard_source_uc_model`) |
 | `prompt_guard_endpoint` | `genie-prompt-guard-2` | Endpoint created by `01_deploy_prompt_guard` |
 | `detection_lookback_days` | `7` | How far back each run re-evaluates |
@@ -235,7 +237,7 @@ Variables you will most likely override (in `databricks.local.yml` or with `--va
 | `pii_ai_extract` | 02, opt-in | `ai_extract` on a sample, for comparison | entity types found, mapped to Presidio types and weighted the same way |
 | `prompt_injection_prompt_guard` | 03 | `ai_query` to a Llama Prompt Guard 2 endpoint; 512-token chunking with max pooling; prompts = direct vector, tool results and model output = indirect | malicious probability |
 | `prompt_injection_ai_classify` | 03 | `ai_classify` three-way judge on Prompt Guard hits plus a random sample | legitimate / destructive-or-boundary-pushing / injection |
-| `guardrail_signal` | 04 | Transparent rules over outcomes and response text | one row per rule hit, severity-weighted |
+| `guardrail_signal` | 04 | Outcome/wording rules, deterministic security signatures over raw and bounded decoded text, repeated calls and long turns | one row per rule and source field; severity, scope, encoding and operational metadata (no content excerpts) |
 
 Guardrail rules, highest severity first: `guardrail_intervention` (classifier prefixes such as
 `Action denied:` and `Review suggested:`), `destructive_action_executed` ("I dropped …"),
@@ -247,6 +249,55 @@ image of that kind in table data or tool output), `destructive_confirmation_requ
 prompt-injection hit), `external_destination`, plus informational `approval_requested`,
 `turn_error` and `tool_error` (recorded in `genie_detections`, but they do not flag the session or
 add to `risk_score`).
+
+### Deterministic security detections
+
+`04_detect_guardrail_signals` also runs repo-native security signatures, informed by the Lakewatch
+GenAI gateway detections, without depending on that pack or its generated notebooks / UC functions.
+These additions make **no AI calls, network requests, credential-validation requests or payload
+executions**. Existing Prompt Guard and AI second-opinion detectors remain separate and unchanged.
+
+The YAML catalog covers credential-shaped content, secret-access operations, suspicious encoded
+execution, instruction overrides / prompt disclosure, external sends, destructive operations and
+permissions changes. It includes Python/shell tool arguments for **Genie Code**, not only Genie
+One SQL. Routine enumeration is informational rather than an automatic security alert.
+
+* Fields are scoped as `prompt`, `answer`, `tool_args` or `tool_result`. Model-call outputs use
+  tool-result scope. Approval requests / user-question arguments use prompt scope, because they
+  are proposals, not executed tool actions. Genie One tool responses embedded in root messages are
+  scanned too. Identical final-answer model outputs are not scanned twice.
+* Passive normalization handles encoded content; only a matching security signature creates a
+  finding, not the mere presence of encoding. Input, candidate, decoded-size and depth limits bound
+  the work. `security_scan_limited` records incomplete coverage without flagging a session.
+* Signature evidence contains pattern IDs, category, original field, scope and encoding, never
+  matched values or decoded payloads. Outcome rules also omit raw excerpts and URLs. Historical
+  evidence outside the re-scored lookback is not rewritten: continue to restrict the detections
+  table and the full-content source tables.
+* Findings retain detector `guardrail_signal`, so existing session flags, risk scoring, timeline and
+  alerts work without a schema migration. `span.field` is `security:<pattern_id>:<source_field>`;
+  `label` is the pattern ID. This distinguishes a secret in a prompt from one in a tool result.
+* `repeated_tool_calls` counts distinct spans with the same tool and code/SQL/command (default 5).
+  `long_running_turn` uses a default 60-minute threshold. Both are heuristics: legitimate polling
+  and long jobs can trigger them. `trace_completeness_warning` (dropped spans or a span-count hint)
+  is informational, not evidence of malicious behaviour. Override these with YAML `runaway` keys
+  `repeat_calls`, `long_turn_minutes` and `span_cap_hint` (default 120).
+* A regex match cannot establish that a credential is live, a secret was successfully read, a
+  destination received data, or an action was malicious. Treat findings as review signals. In
+  particular, authorized secret reads, HTTP integrations and permission changes need context.
+  Model-generated credential examples can also match. Merely calling a value "fake", or having
+  no tool call, does not suppress it: the model could be echoing a real credential from a prompt.
+* The first run of new/changed signatures may create findings for older spans in the lookback and
+  notify once. Review the backfill before enabling notifications in a new deployment.
+
+Run the local regression suite with `python3 -m unittest discover -s tests -v` (Python 3.11+,
+PyYAML and pandas required; no local Spark or Databricks credentials needed). Warehouse SQL fixture tests are skipped
+unless you explicitly set `GENIE_TRACE_TEST_PROFILE` and `GENIE_TRACE_TEST_WAREHOUSE`; they use
+synthetic SELECT-only CTEs, create no resources and read no real traces.
+`tests/evaluate_security_traces.py <export.json>` can score a private JSON export of
+`{product, test_case, field, scope, text}` rows locally; it prints only aggregate counts, synthetic
+RT/BN case IDs and rule IDs, not content. Keep real exports outside the repository and delete them
+after testing. RT labels cover multiple attack types, so the fraction matched is not an end-to-end
+recall metric for these security signatures.
 
 PII findings are weighted by entity type (`pii_weights` on `02_detect_pii`): a finding's `score` is
 Presidio's confidence × the type's weight, and its `label` is the most severe entity.
@@ -290,6 +341,10 @@ Weights live in `src/pipelines/sessions/transformations/genie_sessions.sql`.
   22M model catches direct jailbreak phrasing reliably but scored a table-embedded
   "SYSTEM: … DROP TABLE" row as benign in testing. Keep the `ai_classify` second opinion on, or
   deploy the 86M variant, for indirect injection.
+* **Security signatures**: edit `src/config/security_patterns.yml` (or set `security_patterns_file`).
+  Rules have explicit scopes, scores and flagged/informational status. Configuration is validated;
+  a malformed pattern fails the task rather than silently removing coverage. The whole guardrail
+  lookback is re-scored, clearing removed hits without re-alerting on unchanged findings.
 * **Guardrail wording**: extend `INTERVENTION_PATTERNS`, `REFUSAL_PATTERNS`, `BOUNDARY_PROMPT_REGEX`,
   `MARKDOWN_EXFIL_REGEX`, `CONFIRMATION_REGEX` and `DESTRUCTIVE_EXECUTED_REGEX` in
   `04_detect_guardrail_signals` as you see new phrasing. The
@@ -439,9 +494,10 @@ Verified against live traces in November 2026. These shape what the detectors ca
 ├── src/
 │   ├── pipelines/etl/transformations/        genie_turns.sql, genie_tool_calls.sql
 │   ├── pipelines/sessions/transformations/   genie_sessions.sql, genie_session_timeline.sql
-│   ├── config/                               PII allowlist YAML (base + security layer)
-│   ├── notebooks/                            00 … 06 + _detection_utils, images/
+│   ├── config/                               PII allowlists + deterministic security signatures
+│   ├── notebooks/                            00 … 06 + shared detection / security helpers, images/
 │   └── sql/access_control.sql
+├── tests/                                    local regressions + content-free trace scorecard
 └── docs/
     ├── table_guide_architecture.svg   diagram source
     └── render_diagram.sh              renders the PNG used in 06_table_guide

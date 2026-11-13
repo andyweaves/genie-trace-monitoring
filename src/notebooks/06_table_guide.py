@@ -334,7 +334,7 @@ GROUP BY ALL ORDER BY calls DESC
 # MAGIC | `score` | Confidence or severity in [0, 1]; feeds `risk_score` |
 # MAGIC | `label` | Entity type, class, verdict or rule name |
 # MAGIC | `span` (struct) | `trace_id` (the turn), `span_id` (the step), `field` (`prompt`, `response`, `tool_arguments`, `tool_result`, `model_output`, or a rule name), `text_length` |
-# MAGIC | `details` | JSON evidence: entity offsets, matched text, vector (`direct` / `indirect`), error messages |
+# MAGIC | `details` | JSON evidence: entity offsets, vector (`direct` / `indirect`), security pattern IDs / source scope / encoding, or operational metadata. New guardrail findings omit raw excerpts; older evidence may contain them. |
 # MAGIC | `detection_id` | `sha2(span_id, detector, field)`; the MERGE key that makes re-runs idempotent |
 # MAGIC
 # MAGIC | Detector | Notebook | What it finds | Typical score |
@@ -350,6 +350,12 @@ GROUP BY ALL ORDER BY calls DESC
 # MAGIC   Slice the source column with those offsets if you need to see the match.
 # MAGIC * Guardrail rules re-score their whole lookback window on every run, so editing a pattern
 # MAGIC   updates history. Presidio and Prompt Guard only scan fields they have not seen.
+# MAGIC * Security signatures also use `guardrail_signal`; `span.field` is
+# MAGIC   `security:<pattern_id>:<source_field>`. They check credentials, secret access, encoded
+# MAGIC   content and other deterministic signals without new AI calls. See `details.source_field`
+# MAGIC   and `details.encoding`; no secret value or decoded payload is copied into the finding.
+# MAGIC * `security_scan_limited` and `trace_completeness_warning` are informational coverage signals,
+# MAGIC   not proof of malicious behaviour. Repeated tool calls and long turns are heuristics too.
 # MAGIC * When Prompt Guard and `ai_classify` disagree on the same field, review that row.
 
 # COMMAND ----------
