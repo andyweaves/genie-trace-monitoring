@@ -56,6 +56,11 @@ variables:
       src/config/pii_allowlist_security.yml for SOC / security workloads, or your own file.
     default: ${workspace.file_path}/src/config/pii_allowlist.yml
 
+  # Deterministic security signatures and bounded decoding / runaway thresholds.
+  security_patterns_file:
+    description: Workspace path of the security-pattern YAML used by the guardrail detector.
+    default: ${workspace.file_path}/src/config/security_patterns.yml
+
   # Volume used to stage wheels (spaCy model for Presidio).
   libs_volume:
     default: genie_tracing_libs

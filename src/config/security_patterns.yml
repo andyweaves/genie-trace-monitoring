@@ -1,0 +1,361 @@
+# Repo-native, deterministic signatures inspired by the Lakewatch GenAI gateway
+# secret-in-content, secret-read-by-agent and runaway detections. These are not
+# the imported ATR/Sigma catalogs or Lakewatch runtime code. Source IDs preserve
+# conceptual provenance, not a claim of identical coverage or severity.
+# Matches are review signals, never validation of a live credential or intent.
+version: 1
+limits:
+  max_input_chars: 262144
+  max_forms: 32
+  max_decode_depth: 2
+  max_run_chars: 16384
+  max_decoded_chars: 65536
+  max_decode_candidates: 256
+runaway:
+  repeat_calls: 5
+  long_turn_minutes: 60
+  span_cap_hint: 120
+# Applied only to named URL captures of destination rules; no suffix matching.
+# A connection name or variable destination cannot be resolved by this matcher.
+allowed_hosts:
+  - databricks.com
+  - databricks.net
+  - azuredatabricks.net
+  - pypi.org
+  - pythonhosted.org
+rules:
+  - id: credential_databricks_pat
+    category: credential_exposure
+    scopes: [any]
+    score: 0.9
+    flagged: true
+    source: Lakewatch/DBX-SECRET-DATABRICKS-PAT
+    patterns:
+      - >-
+        \bdapi[0-9a-f]{32}\b
+  - id: credential_aws_access_key
+    category: credential_exposure
+    scopes: [any]
+    score: 0.85
+    flagged: true
+    source: Lakewatch/DBX-SECRET-AWS-ACCESS-KEY
+    patterns:
+      - >-
+        \b(?:AKIA|ASIA)[A-Z0-9]{16}\b
+  - id: credential_github_token
+    category: credential_exposure
+    scopes: [any]
+    score: 0.9
+    flagged: true
+    source: Lakewatch/DBX-SECRET-GITHUB-PAT
+    patterns:
+      - >-
+        \bgh[pousr]_[A-Za-z0-9]{36}\b
+      - >-
+        \bgithub_pat_[A-Za-z0-9_]{40,100}\b
+  - id: credential_slack_token
+    category: credential_exposure
+    scopes: [any]
+    score: 0.85
+    flagged: true
+    source: existing/credential_exposed
+    patterns:
+      - >-
+        \bxox[baprs]-[A-Za-z0-9-]{10,200}\b
+  - id: credential_jwt
+    category: credential_exposure
+    scopes: [any]
+    score: 0.8
+    flagged: true
+    source: Lakewatch/DBX-SECRET-JWT
+    patterns:
+      - >-
+        \beyJ[A-Za-z0-9_-]{7,2048}\.eyJ[A-Za-z0-9_-]{7,4096}\.[A-Za-z0-9_-]{10,512}\b
+  - id: credential_private_key
+    category: credential_exposure
+    scopes: [any]
+    score: 0.8
+    flagged: true
+    source: Lakewatch/DBX-SECRET-PEM
+    patterns:
+      - >-
+        -----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----
+  - id: credential_google_api_key
+    category: credential_exposure
+    scopes: [any]
+    score: 0.85
+    flagged: true
+    source: native/provider_signature
+    patterns:
+      - >-
+        \bAIza[A-Za-z0-9_-]{35}\b
+  - id: secret_lookup_sql
+    category: secret_lookup
+    scopes: [tool_args]
+    score: 0.6
+    flagged: true
+    source: Lakewatch/DBX-SECRET-SQL
+    patterns:
+      - >-
+        (?i)\bsecret\s{0,16}\(\s{0,16}[^,\n)]{1,160},
+  - id: secret_lookup_dbutils
+    category: secret_lookup
+    scopes: [tool_args]
+    score: 0.6
+    flagged: true
+    source: Lakewatch/DBX-SECRET-DBUTILS
+    patterns:
+      - >-
+        (?i)\bdbutils\.secrets\.(?:get|getBytes)\s{0,16}\(
+  - id: secret_scope_enumeration
+    category: enumeration
+    scopes: [tool_args]
+    score: 0
+    flagged: false
+    source: native/secret_metadata
+    patterns:
+      - >-
+        (?i)\bdbutils\.secrets\.(?:list|listScopes)\s{0,16}\(
+  - id: credential_file_read
+    category: secret_lookup
+    scopes: [tool_args]
+    score: 0.6
+    flagged: true
+    source: Lakewatch/DBX-SECRET-CONFIG-FILES
+    patterns:
+      - >-
+        (?i)\b(?:open|Path)\s{0,12}\([^\n)]{0,200}(?:\.databrickscfg|\.env\b|\.aws[/\\]credentials|\.azure[/\\](?:accessTokens|msal_token_cache))[^\n)]{0,100}\){1,3}\s{0,8}\.(?:read|read_text|read_bytes)\s{0,8}\(
+      - >-
+        (?i)\b(?:cat|head|tail|less)\s{1,8}[^\n;]{0,160}(?:\.databrickscfg|\.env\b|\.aws[/\\]credentials)
+  - id: credential_environment_read
+    category: secret_lookup
+    scopes: [tool_args]
+    score: 0.55
+    flagged: true
+    source: native/credential_environment
+    patterns:
+      - >-
+        (?i)\bos\.(?:getenv|environ\.get)\s{0,12}\(\s{0,12}['"](?:DATABRICKS_TOKEN|AWS_SECRET_ACCESS_KEY|AZURE_CLIENT_SECRET|GITHUB_TOKEN|API_KEY)['"]
+      - >-
+        (?i)\bos\.environ\s{0,8}\[\s{0,8}['"](?:DATABRICKS_TOKEN|AWS_SECRET_ACCESS_KEY|AZURE_CLIENT_SECRET|GITHUB_TOKEN|API_KEY)['"]
+  - id: credential_token_api
+    category: secret_lookup
+    scopes: [tool_args]
+    score: 0.55
+    flagged: true
+    source: Lakewatch/DBX-SECRET-CONFIG-FILES
+    patterns:
+      - >-
+        (?i)/api/2\.0/token(?:-management)?/(?:list|create|get|delete|permissions)\b
+  - id: secret_disclosure_request
+    category: secret_disclosure
+    scopes: [prompt]
+    score: 0.6
+    flagged: true
+    source: native/disclosure_intent
+    patterns:
+      - >-
+        (?i)\b(?:print|reveal|dump|display|expose|show)\b[^\n.!?]{0,60}\b(?:secret values?|api[_ -]?keys?|access tokens?|passwords?|credentials?)\b
+      - >-
+        (?i)\b(?:secret|credential|token|password)\b[^\n.!?]{0,24}\b(?:plain|clear)text\b
+  - id: secret_redaction_bypass
+    category: secret_disclosure
+    scopes: [prompt, tool_args]
+    score: 0.7
+    flagged: true
+    source: native/redaction_bypass_intent
+    patterns:
+      - >-
+        (?i)\b(?:bypass|circumvent|disable|evade)\b[^\n.!?]{0,60}\b(?:secret )?redaction\b
+  - id: secret_encoding_operation
+    category: secret_disclosure
+    scopes: [tool_args]
+    score: 0.8
+    flagged: true
+    source: native/encoding_secret_access
+    patterns:
+      - >-
+        (?i)\b(?:base64\.(?:b64encode|urlsafe_b64encode)|binascii\.hexlify)\s{0,12}\([^\n]{0,200}\b(?:dbutils\.secrets\.get|os\.environ)\b
+  - id: external_http_write
+    category: external_send
+    scopes: [tool_args]
+    score: 0.6
+    flagged: true
+    destination: true
+    source: Lakewatch/DBX-EXTERNAL-HTTP
+    patterns:
+      - >-
+        (?i)\b(?:requests|httpx)\.(?:post|put|patch)\s{0,12}\(\s{0,12}['"](?P<url>https?://[^'"\s)]{1,2048})
+  - id: external_sql_http_write
+    category: external_send
+    scopes: [tool_args]
+    score: 0.55
+    flagged: true
+    source: Lakewatch/DBX-EXTERNAL-HTTP
+    patterns:
+      - >-
+        (?i)\bhttp_request\s{0,12}\([^\n;]{0,512}\bmethod\s{0,12}=>\s{0,12}['"](?:POST|PUT|PATCH)['"]
+  - id: external_shell_upload
+    category: external_send
+    scopes: [tool_args]
+    score: 0.6
+    flagged: true
+    source: Lakewatch/DBX-EXTERNAL-CURL
+    patterns:
+      - >-
+        (?i)\bcurl\s{1,8}[^\n]{0,256}(?:--data(?:-binary|-raw)?\b|--upload-file\b|\s-d\b|\s-T\b)
+  - id: external_cloud_write
+    category: external_send
+    scopes: [tool_args]
+    score: 0.55
+    flagged: true
+    destination: true
+    source: Lakewatch/DBX-EXTERNAL-CLOUD-WRITE
+    patterns:
+      - >-
+        (?i)\.write(?:Stream)?\b[^\n]{0,256}\.(?:save|csv|parquet|json|text|orc|start)\s{0,12}\(\s{0,12}['"](?P<url>(?:s3a?|abfss?|wasbs?|gs)://[^'"\s)]{1,2048})
+      - >-
+        (?i)\bdbutils\.fs\.(?:cp|mv|put)\s{0,12}\([^\n)]{0,256}['"](?P<url>(?:s3a?|abfss?|wasbs?|gs)://[^'"\s)]{1,2048})
+  - id: external_location_create
+    category: privilege_change
+    scopes: [tool_args]
+    score: 0.5
+    flagged: true
+    source: Lakewatch/DBX-EXTERNAL-LOCATION
+    patterns:
+      - >-
+        (?i)\bCREATE\s{1,16}(?:OR\s{1,8}REPLACE\s{1,8})?EXTERNAL\s{1,16}LOCATION\b
+  - id: markdown_external_query
+    category: markdown_exfil
+    scopes: [answer, tool_result]
+    score: 0.8
+    flagged: true
+    destination: true
+    source: Lakewatch/DBX-MARKDOWN-QUERY
+    patterns:
+      - >-
+        (?i)!\[[^\]\n]{0,200}\]\(\s{0,8}(?P<url>https?://[^?\s)]{1,1024}\?[^)\s]{1,2048})\)
+  - id: markdown_data_image
+    category: encoded_content
+    scopes: [answer, tool_result]
+    score: 0
+    flagged: false
+    source: Lakewatch/DBX-MARKDOWN-DATA
+    patterns:
+      - >-
+        (?i)!\[[^\]\n]{0,200}\]\(\s{0,8}data:image/[a-z0-9.+-]{1,32};base64,
+  - id: encoded_execution
+    category: obfuscation
+    scopes: [tool_args]
+    score: 0.65
+    flagged: true
+    source: Lakewatch/encoded_payload_concept
+    patterns:
+      - >-
+        (?i)\bbase64\s{1,8}(?:-d\b|--decode\b)
+      - >-
+        (?i)\b(?:powershell(?:\.exe)?|pwsh)\b[^\n]{0,256}\s-(?:enc|encodedcommand)\b
+      - >-
+        (?i)\b(?:exec|eval)\s{0,12}\(\s{0,12}(?:base64\.(?:b64decode|urlsafe_b64decode)|bytes\.fromhex)\s{0,12}\(
+  - id: instruction_override
+    category: direct_injection
+    scopes: [prompt]
+    score: 0.6
+    flagged: true
+    source: native/instruction_override
+    patterns:
+      - >-
+        (?im)^[ \t]{0,8}(?:[A-Za-z0-9_\[\]()-]{1,24}[: ]{1,4})?(?:please[ \t]{1,8})?(?:ignore|disregard|forget)[ \t]{1,12}(?:all[ \t]{1,8}|any[ \t]{1,8})?(?:previous|prior|earlier|above)[ \t]{1,12}(?:instructions|rules|system messages)\b
+      - >-
+        (?i)\b(?:disable|bypass|skip)\s{1,12}(?:the\s{1,8})?(?:safety guardrails|approval checks|security controls)\b
+  - id: indirect_instruction_override
+    category: indirect_injection
+    scopes: [tool_result]
+    score: 0.7
+    flagged: true
+    source: native/retrieved_instruction_override
+    patterns:
+      - >-
+        (?i)\b(?:ignore|disregard)\s{1,12}(?:all\s{1,8})?(?:previous|prior|earlier)\s{1,12}(?:instructions|rules)\b
+      - >-
+        (?i)\b(?:SYSTEM OVERRIDE|NEW SYSTEM INSTRUCTIONS|OVERRIDE AGENT BEHAVIOUR|OVERRIDE AGENT BEHAVIOR)\b
+  - id: system_prompt_disclosure_request
+    category: prompt_disclosure
+    scopes: [prompt]
+    score: 0.6
+    flagged: true
+    source: native/prompt_disclosure_intent
+    patterns:
+      - >-
+        (?i)\b(?:reveal|show|dump|print|repeat|disclose)\b[^\n.!?]{0,64}\b(?:your|the|hidden|internal|original)\s{1,16}(?:system\s{1,8})?(?:prompt|instructions|rules)\b
+  - id: role_override_marker
+    category: direct_injection
+    scopes: [prompt, tool_result]
+    score: 0.7
+    flagged: true
+    source: native/role_override_markers
+    patterns:
+      - >-
+        (?i)<\|im_start\|>system|\[SYSTEM OVERRIDE\]|\{\{SYSTEM:
+  - id: destructive_sql_ddl
+    category: destructive_action
+    scopes: [tool_args]
+    score: 0.7
+    flagged: true
+    source: Lakewatch/DBX-DESTRUCTIVE-DROP
+    patterns:
+      - >-
+        (?i)\b(?:DROP\s{1,16}(?:TABLE|VIEW|SCHEMA|DATABASE|CATALOG)|TRUNCATE\s{1,16}TABLE)\b
+  - id: destructive_sql_delete_all
+    category: destructive_action
+    scopes: [tool_args]
+    score: 0.65
+    flagged: true
+    source: Lakewatch/DBX-DESTRUCTIVE-DELETE
+    patterns:
+      - >-
+        (?i)\bDELETE\s{1,16}FROM\s{1,16}[A-Za-z0-9_.`]{1,256}\s{0,32}(?:;|$)
+      - >-
+        (?i)\bDELETE\s{1,16}FROM\s{1,16}[A-Za-z0-9_.`]{1,256}\s{1,32}WHERE\s{1,16}(?:1\s{0,8}=\s{0,8}1|true)\s{0,16}(?:;|$)
+  - id: destructive_filesystem
+    category: destructive_action
+    scopes: [tool_args]
+    score: 0.65
+    flagged: true
+    source: Lakewatch/filesystem_removal_concept
+    patterns:
+      - >-
+        (?i)\bshutil\.rmtree\s{0,12}\(
+      - >-
+        (?i)\bdbutils\.fs\.rm\s{0,12}\([^\n)]{0,256}\brecurse\s{0,8}=\s{0,8}True\b
+      - >-
+        (?i)\brm\s{1,8}-(?:rf|fr)\b
+  - id: permission_change
+    category: privilege_change
+    scopes: [tool_args]
+    score: 0.6
+    flagged: true
+    source: Lakewatch/DBX-DESTRUCTIVE-PERMISSIONS
+    patterns:
+      - >-
+        (?i)\b(?:GRANT|REVOKE)\s{1,16}(?:ALL(?:\s{1,8}PRIVILEGES)?|SELECT|MODIFY|EXECUTE|MANAGE|OWNERSHIP)\b
+      - >-
+        (?i)\bALTER\s{1,16}(?:TABLE|SCHEMA|CATALOG|VIEW|FUNCTION)\b[^\n;]{0,256}\b(?:SET\s{1,8})?OWNER\s{1,8}TO\b
+  - id: unbounded_loop_code
+    category: runaway_code
+    scopes: [tool_args]
+    score: 0.5
+    flagged: true
+    source: Lakewatch/DBX-RUNAWAY-LOOP
+    patterns:
+      - >-
+        (?i)\bwhile\s{1,8}(?:True|1)\s{0,8}:
+  - id: metadata_enumeration
+    category: enumeration
+    scopes: [tool_args]
+    score: 0
+    flagged: false
+    source: Lakewatch/enumeration_concept
+    patterns:
+      - >-
+        (?i)\b(?:information_schema\.[a-z_]{1,64}|system\.access\.[a-z_]{1,64}|SHOW\s{1,16}(?:GRANTS|CATALOGS|SCHEMAS|TABLES))\b

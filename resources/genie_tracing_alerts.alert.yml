@@ -60,7 +60,7 @@ resources:
         `SELECT * FROM ${var.catalog}.${var.schema}.genie_session_timeline WHERE conversation_id = '<conversation_id>' ORDER BY step_number`
 
         The evidence for each flag (entity types and offsets, prompt-injection scores, matched
-        guardrail wording) is in
+        guardrail/security rule metadata) is in
         [genie_detections](${var.workspace_url}/explore/data/${var.catalog}/${var.schema}/genie_detections).
         Alert: @ALERT_URL
       evaluation:

@@ -33,8 +33,42 @@
 
 # COMMAND ----------
 
+# MAGIC %run ./_security_pattern_utils
+
+# COMMAND ----------
+
 # MAGIC %md
-# MAGIC ## Rule definitions
+# MAGIC ## Security-pattern configuration
+# MAGIC
+# MAGIC Repo-native signatures and bounded, passive decoding: no AI calls, credential validation,
+# MAGIC network requests or payload execution. Invalid configuration fails visibly rather than
+# MAGIC silently dropping rules. New findings contain metadata only; original text stays in the
+# MAGIC restricted source tables. Matcher limits are recorded as informational coverage findings.
+
+# COMMAND ----------
+
+import json
+import os
+
+import pandas as pd
+from pyspark.sql import functions as F
+from pyspark.sql.functions import pandas_udf
+
+dbutils.widgets.text("security_patterns_file", "../config/security_patterns.yml", "Security-pattern YAML")
+SECURITY_CONFIG = load_security_config(os.path.abspath(dbutils.widgets.get("security_patterns_file")))
+scan_security_text = build_security_matcher(SECURITY_CONFIG)
+RUNAWAY_CONFIG = SECURITY_CONFIG.get("runaway", {})
+LOOP_MIN_CALLS = int(RUNAWAY_CONFIG.get("repeat_calls", 5))
+LONG_TURN_MINUTES = int(RUNAWAY_CONFIG.get("long_turn_minutes", 60))
+SPAN_CAP_HINT = int(RUNAWAY_CONFIG.get("span_cap_hint", 120))
+if min(LOOP_MIN_CALLS, LONG_TURN_MINUTES, SPAN_CAP_HINT) <= 0:
+    raise ValueError("Runaway thresholds must be positive integers")
+print(f"Loaded {len(SECURITY_CONFIG['rules'])} deterministic security patterns")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Outcome and guardrail-wording rules
 # MAGIC
 # MAGIC Each rule is a SQL predicate over `genie_turns` or `genie_tool_calls`. `score` is the
 # MAGIC severity contributed to the session risk score. `flagged = false` rules are informational:
@@ -144,7 +178,6 @@ BOUNDARY_PROMPT_REGEX = (
 SENSITIVE_ARGS_REGEX = (
     r"(?i)(\bDROP\s+(?:TABLE|SCHEMA|DATABASE|CATALOG|VIEW)\b|\bTRUNCATE\s+TABLE\b|\bDELETE\s+FROM\b|"
     r"\bGRANT\s+|\bREVOKE\s+|\bALTER\s+\S+\s+(?:\S+\s+)?OWNER\b|"
-    r"dbutils\.secrets|secrets\.get|os\.environ|\bTOKEN\b|\bPASSWORD\b|"
     r"\bcurl\s|\bwget\s|requests\.(?:post|put|patch)|urllib\.request|socket\.|"
     r"rm\s+-rf|shutil\.rmtree|dbutils\.fs\.rm)"
 )
@@ -162,12 +195,8 @@ MARKDOWN_EXFIL_REGEX = (
     r"[^)\s]*\?[^)\s]*="
 )
 
-# Credential-shaped strings: Databricks PAT, AWS access key, GitHub / Slack tokens, JWT, private
-# key header. Evidence records only the first four characters, never the value.
-CREDENTIAL_REGEX = (
-    r"(\bdapi[0-9a-f]{32}\b|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b|\bgh[pousr]_[A-Za-z0-9]{36}\b|\bxox[abpr]-[A-Za-z0-9-]{10,}|"
-    r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)"
-)
+# Credential signatures now live in security_patterns.yml and scan each field separately,
+# including decoded forms. Do not concatenate prompt and response into a credential candidate.
 
 DESTRUCTIVE_TOOL_REGEX = r"(?i)^(?:delete|drop|remove|truncate|destroy|grant|revoke|publish|update_permissions|set_permissions|share)"
 
@@ -188,7 +217,6 @@ SENSITIVE_ARGS_SQL = sql_escape(SENSITIVE_ARGS_REGEX)
 EXTERNAL_URL_SQL = sql_escape(EXTERNAL_URL_REGEX)
 DESTRUCTIVE_TOOL_SQL = sql_escape(DESTRUCTIVE_TOOL_REGEX)
 MARKDOWN_EXFIL_SQL = sql_escape(MARKDOWN_EXFIL_REGEX)
-CREDENTIAL_SQL = sql_escape(CREDENTIAL_REGEX)
 
 INTERVENTION_SQL = sql_escape(INTERVENTION_REGEX)
 CONFIRMATION_SQL = sql_escape(CONFIRMATION_REGEX)
@@ -236,9 +264,6 @@ RULES = [
     dict(name="boundary_pushing_prompt", source="turns", flagged=True, score=0.5,
          predicate=f"prompt RLIKE '{BOUNDARY_PROMPT_SQL}'",
          evidence=f"named_struct('match', regexp_extract(prompt, '{BOUNDARY_PROMPT_SQL}', 1), 'prompt', substr(prompt, 1, 500))"),
-    dict(name="credential_exposed", source="turns", flagged=True, score=0.7,
-         predicate=f"text RLIKE '{CREDENTIAL_SQL}'",
-         evidence=f"named_struct('prefix', substr(regexp_extract(text, '{CREDENTIAL_SQL}', 1), 1, 4), 'prompt', substr(regexp_replace(prompt, '{CREDENTIAL_SQL}', '[credential]'), 1, 300))"),
     dict(name="markdown_image_exfil_response", source="turns", flagged=True, score=0.8,
          predicate=f"response RLIKE '{MARKDOWN_EXFIL_SQL}'",
          evidence=f"named_struct('match', regexp_extract(response, '{MARKDOWN_EXFIL_SQL}', 0), 'prompt', substr(prompt, 1, 300))"),
@@ -279,9 +304,6 @@ RULES = [
     dict(name="markdown_image_exfil", source="tools", flagged=True, score=0.6,
          predicate=f"coalesce(tool_result, '') || ' ' || coalesce(response_text, '') RLIKE '{MARKDOWN_EXFIL_SQL}'",
          evidence=f"named_struct('tool_name', tool_name, 'match', regexp_extract(coalesce(tool_result, '') || ' ' || coalesce(response_text, ''), '{MARKDOWN_EXFIL_SQL}', 0))"),
-    dict(name="credential_exposed_tool", source="tools", flagged=True, score=0.7,
-         predicate=f"text RLIKE '{CREDENTIAL_SQL}'",
-         evidence=f"named_struct('tool_name', tool_name, 'prefix', substr(regexp_extract(text, '{CREDENTIAL_SQL}', 1), 1, 4))"),
     dict(name="tool_error", source="tools", flagged=False, score=0.1,
          predicate="span_type = 'tool_call' AND (is_error OR (tool_outcome IS NOT NULL AND tool_outcome <> 'SUCCESS'))",
          evidence="named_struct('tool_name', tool_name, 'tool_outcome', tool_outcome, 'status_message', status_message)"),
@@ -311,7 +333,9 @@ print(f"Re-scoring guardrail signals since {CUTOFF_SQL}")
 SOURCES = {
     "turns": f"""
         SELECT trace_id, span_id, coalesce(conversation_id, trace_id) AS conversation_id, product, workspace_id, requester,
-               started_at AS span_time, prompt, response,
+               started_at AS span_time, prompt, response, output_messages_raw, duration_ms,
+               completeness.expected_span_count AS expected_span_count,
+               completeness.dropped_span_count AS dropped_span_count,
                outcome.run_outcome AS run_outcome, outcome.genie_status AS genie_status, outcome.error_code AS error_code,
                outcome.status_message AS status_message, is_error,
                coalesce(prompt, '') || ' ' || coalesce(response, '') AS text
@@ -332,6 +356,12 @@ selects = []
 for r in RULES:
     predicate = r["predicate"]
     evidence = r["evidence"]
+    # Keep only operational metadata, not excerpts, URLs, matched text or exception messages:
+    # otherwise a secret finding could copy the same credential into another rule's evidence.
+    safe_evidence = (
+        f"to_json(map_filter(from_json(to_json({evidence}), 'MAP<STRING,STRING>'), "
+        "(k, v) -> k IN ('tool_name', 'span_type', 'tool_outcome', 'run_outcome', 'error_code', 'genie_status')))"
+    )
     # Regex literals inside predicates/evidence were built with single quotes already escaped for SQL.
     selects.append(
         f"""
@@ -340,7 +370,7 @@ for r in RULES:
                {str(r["flagged"]).lower()} AS flagged,
                CAST({r["score"]} AS DOUBLE) AS score,
                '{r["name"]}' AS label,
-               to_json({evidence}) AS details
+               {safe_evidence} AS details
         FROM {r["source"]}_src
         WHERE {predicate}
         """
@@ -349,7 +379,176 @@ for r in RULES:
 for name, sql in SOURCES.items():
     spark.sql(sql).createOrReplaceTempView(f"{name}_src")
 
-signals = spark.sql(" UNION ALL ".join(selects))
+outcome_signals = spark.sql(" UNION ALL ".join(selects)).withColumn("text_length", F.length("text"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Deterministic security signatures, including embedded tool responses
+# MAGIC
+# MAGIC Match each field separately so its scope and provenance survive. Approval requests and
+# MAGIC user questions are proposals, not executed code: their arguments use prompt scope.
+# MAGIC Genie One can embed tool responses in a root message even when there is no child tool span.
+# MAGIC A model output identical to the final answer is scanned once, as the answer.
+# MAGIC
+# MAGIC No raw or decoded content is copied to finding evidence. Bounded scans that hit a resource
+# MAGIC limit emit `security_scan_limited` (informational), rather than silently implying full coverage.
+
+# COMMAND ----------
+
+SECURITY_FIELDS_SQL = f"""
+WITH root_texts AS (
+  SELECT *, nullif(array_join(flatten(transform(
+    from_json(output_messages_raw,
+      'ARRAY<STRUCT<parts:ARRAY<STRUCT<type:STRING,response:STRING>>>>'),
+    m -> transform(filter(m.parts, p -> p.type = 'tool_call_response' AND p.response IS NOT NULL),
+                   p -> p.response))), '\\n'), '') AS embedded_tool_result
+  FROM turns_src
+), fields AS (
+  SELECT trace_id, span_id, conversation_id, product, workspace_id, requester, span_time,
+         'prompt' AS field, 'prompt' AS scope, prompt AS text, CAST(NULL AS STRING) AS tool_name
+  FROM root_texts
+  UNION ALL
+  SELECT trace_id, span_id, conversation_id, product, workspace_id, requester, span_time,
+         'response', 'answer', response, CAST(NULL AS STRING)
+  FROM root_texts
+  UNION ALL
+  SELECT trace_id, span_id, conversation_id, product, workspace_id, requester, span_time,
+         'embedded_tool_result', 'tool_result', embedded_tool_result, CAST(NULL AS STRING)
+  FROM root_texts
+  UNION ALL
+  SELECT trace_id, span_id, conversation_id, product, workspace_id, requester, span_time,
+         'tool_arguments', CASE WHEN {ACTION_TOOL} THEN 'tool_args' ELSE 'prompt' END,
+         tool_arguments, tool_name
+  FROM tools_src WHERE span_type IN ('tool_call', 'approval_request', 'user_question')
+  UNION ALL
+  SELECT trace_id, span_id, conversation_id, product, workspace_id, requester, span_time,
+         'tool_result', 'tool_result', tool_result, tool_name
+  FROM tools_src WHERE span_type IN ('tool_call', 'approval_request', 'user_question')
+  UNION ALL
+  SELECT c.trace_id, c.span_id, c.conversation_id, c.product, c.workspace_id, c.requester, c.span_time,
+         'model_output', 'tool_result', c.response_text, c.tool_name
+  FROM tools_src c
+  WHERE c.span_type = 'model_call' AND NOT EXISTS (
+    SELECT 1 FROM turns_src t WHERE t.trace_id = c.trace_id AND t.response = c.response_text
+  )
+)
+SELECT * FROM fields WHERE text IS NOT NULL AND length(trim(text)) > 0
+"""
+
+
+@pandas_udf("string")
+def security_scan(texts: pd.Series, scopes: pd.Series) -> pd.Series:
+    return pd.Series([json.dumps(scan_security_text(text, scope), separators=(",", ":"))
+                      for text, scope in zip(texts, scopes)])
+
+
+SCAN_SCHEMA = """STRUCT<
+  hits:ARRAY<STRUCT<rule_id:STRING,category:STRING,score:DOUBLE,flagged:BOOLEAN,encoding:STRING,source:STRING>>,
+  limits:ARRAY<STRING>,scanned_chars:INT>
+"""
+security_scored = (
+    spark.sql(SECURITY_FIELDS_SQL)
+    .withColumn("text_length", F.length("text"))
+    .withColumn("scan", F.from_json(security_scan("text", "scope"), SCAN_SCHEMA))
+)
+# Explode actual hits and an optional limit marker together, so each field is evaluated once.
+limit_hit = F.struct(
+    F.lit("security_scan_limited").alias("rule_id"), F.lit("scan_coverage").alias("category"),
+    F.lit(0.0).alias("score"), F.lit(False).alias("flagged"),
+    F.lit("none").alias("encoding"), F.lit("matcher_limits").alias("source"),
+)
+security_signals = (
+    security_scored
+    .withColumn("hit", F.explode(F.concat(
+        F.col("scan.hits"),
+        F.when(F.size("scan.limits") > 0, F.array(limit_hit))
+         .otherwise(F.array().cast("array<struct<rule_id:string,category:string,score:double,flagged:boolean,encoding:string,source:string>>")),
+    )))
+    .select(
+        "trace_id", "span_id", "conversation_id", "product", "workspace_id", "requester", "span_time",
+        F.lit(None).cast("string").alias("text"), "text_length",
+        F.concat(F.lit("security:"), F.col("hit.rule_id"), F.lit(":"), F.col("field")).alias("field"),
+        F.col("hit.flagged").alias("flagged"), F.col("hit.score").alias("score"),
+        F.col("hit.rule_id").alias("label"),
+        F.to_json(F.struct(
+            F.col("field").alias("source_field"), "scope", "tool_name",
+            F.col("hit.rule_id").alias("pattern_id"), F.col("hit.category").alias("category"),
+            F.col("hit.encoding").alias("encoding"), F.col("hit.source").alias("source"),
+            F.col("scan.scanned_chars").alias("scanned_chars"), F.col("scan.limits").alias("limits"),
+        )).alias("details"),
+    )
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Repeated tool calls, long turns and trace completeness
+# MAGIC
+# MAGIC Identical tool calls are counted by distinct span, not duplicate trace deliveries. The
+# MAGIC code/SQL/command is used for comparison only and is never included in evidence. Repetition
+# MAGIC and long turns are heuristics (polling and long jobs can be legitimate). A span-cap hint or
+# MAGIC dropped spans is informational: missing telemetry does not establish malicious behaviour.
+# MAGIC Thresholds live in the YAML's optional `runaway` section.
+
+# COMMAND ----------
+
+RUNAWAY_SQL = f"""
+WITH calls AS (
+  SELECT DISTINCT trace_id, span_id, tool_name,
+    coalesce(get_json_object(tool_arguments, '$.code'), get_json_object(tool_arguments, '$.query'),
+             get_json_object(tool_arguments, '$.sql'), get_json_object(tool_arguments, '$.statement'),
+             get_json_object(tool_arguments, '$.command'), tool_arguments) AS code
+  FROM tools_src
+  WHERE {ACTION_TOOL} AND tool_name IS NOT NULL
+    AND tool_arguments IS NOT NULL AND length(trim(tool_arguments)) > 0
+), repeats AS (
+  SELECT trace_id, max(n) AS repeated_calls
+  FROM (SELECT trace_id, tool_name, code, count(DISTINCT span_id) AS n
+        FROM calls GROUP BY trace_id, tool_name, code)
+  GROUP BY trace_id
+), events AS (
+  SELECT t.*, coalesce(r.repeated_calls, 0) AS repeated_calls,
+    CASE WHEN coalesce(r.repeated_calls, 0) >= {LOOP_MIN_CALLS} THEN 'repeated_tool_calls' END AS loop_rule,
+    CASE WHEN duration_ms > {LONG_TURN_MINUTES} * 60.0 * 1000 THEN 'long_running_turn' END AS duration_rule,
+    CASE WHEN expected_span_count >= {SPAN_CAP_HINT} OR dropped_span_count > 0 THEN 'trace_completeness_warning' END AS completeness_rule
+  FROM turns_src t LEFT JOIN repeats r USING (trace_id)
+)
+SELECT trace_id, span_id, conversation_id, product, workspace_id, requester, span_time,
+       CAST(NULL AS STRING) AS text, CAST(0 AS INT) AS text_length,
+       reason AS field, reason <> 'trace_completeness_warning' AS flagged,
+       CASE WHEN reason = 'repeated_tool_calls' THEN 0.5
+            WHEN reason = 'long_running_turn' THEN 0.4 ELSE 0.0 END AS score,
+       reason AS label,
+       to_json(named_struct('repeated_calls', repeated_calls, 'duration_ms', duration_ms,
+                            'expected_spans', expected_span_count, 'dropped_spans', dropped_span_count)) AS details
+FROM events
+LATERAL VIEW explode(array(loop_rule, duration_rule, completeness_rule)) x AS reason
+WHERE reason IS NOT NULL
+"""
+runaway_signals = spark.sql(RUNAWAY_SQL)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## One idempotent write for every guardrail/security signal
+# MAGIC
+# MAGIC All branches share one MERGE and one cutoff. A removed rule clears its old findings inside
+# MAGIC the lookback window; an unchanged finding keeps its original alert timestamp. Previous
+# MAGIC credential rules are replaced by the field-scoped signatures, not run alongside them.
+
+# COMMAND ----------
+
+SIGNAL_COLUMNS = [
+    "trace_id", "span_id", "conversation_id", "product", "workspace_id", "requester", "span_time",
+    "text", "text_length", "field", "flagged", "score", "label", "details",
+]
+signals = (
+    outcome_signals.select(*SIGNAL_COLUMNS)
+    .unionByName(security_signals.select(*SIGNAL_COLUMNS))
+    .unionByName(runaway_signals.select(*SIGNAL_COLUMNS))
+    .dropDuplicates(["trace_id", "span_id", "field"])
+)
 write_detections(signals, "guardrail_signal", rescore_since=CUTOFF_SQL)
 
 # COMMAND ----------
