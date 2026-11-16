@@ -132,6 +132,15 @@ class PayloadTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "details path"):
             UTILS.render_query(rule, CTX)
 
+    def test_investigate_query_uses_timeline_columns(self):
+        timeline = (ROOT / "src/pipelines/sessions/transformations/genie_session_timeline.sql").read_text()
+        final_select = timeline[timeline.rindex("SELECT"):]
+        for name, p in PAYLOADS.items():
+            order_by = re.search(r"ORDER BY (\w+)'\)", p["batch"]["sql"]["query"])
+            self.assertIsNotNone(order_by, name)
+            self.assertRegex(final_select, rf"\b{order_by.group(1)}\b", f"{name}: timeline has no {order_by.group(1)}")
+            self.assertIn("conversation_id", final_select)
+
     def test_summary_and_context_only_use_output_columns(self):
         for name, p in PAYLOADS.items():
             for placeholder in re.findall(r"\{([a-z_]+)\}", p["output"]["summary"]):

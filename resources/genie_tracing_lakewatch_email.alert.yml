@@ -1,0 +1,81 @@
+# SQL Alert (v2): email digest of new Lakewatch signals from this repo's detection rules.
+#
+# Lakewatch exports alerts only to a webhook, Jira, ServiceNow, Tines or Slack; it does not send
+# email. This alert reads the Lakewatch signals view and emails the signals at or above
+# ${var.lakewatch_email_min_severity} (default High) that were created since the previous
+# evaluation, highest severity first.
+#
+# Only rules in ${var.lakewatch_catalog}.${var.lakewatch_schema} named genie_* are included, i.e.
+# the rules src/lakewatch/rule_catalog.yml deploys. "New" means created in the last hour, matching
+# the hourly cron below: change both together. The alert triggers when the query returns any row
+# (empty_result_state OK); no aggregation, so @QUERY_RESULT_TABLE lists every signal.
+#
+# Its schedule follows lakewatch_email_pause_status (default: schedule_pause_status, so PAUSED
+# in dev and UNPAUSED in prod). Notifications carry rule, severity, summary and identifiers only,
+# never prompt / response text: alert emails sit outside the access controls in
+# src/sql/access_control.sql. The alert's owner needs SELECT on the signals view.
+resources:
+  alerts:
+    genie_lakewatch_signals_email:
+      display_name: "[${bundle.target}] Genie: new Lakewatch signals"
+      warehouse_id: ${var.warehouse_id}
+      query_text: |
+        WITH ranked AS (
+          SELECT
+            s.*,
+            array_position(array('Informational', 'Low', 'Medium', 'High', 'Critical'), s.severity) AS severity_rank,
+            array_position(array('Informational', 'Low', 'Medium', 'High', 'Critical'),
+                           '${var.lakewatch_email_min_severity}')                                  AS min_rank
+          FROM `${var.lakewatch_catalog}`.`__lakewatch`.signals s
+          WHERE startswith(s.rule_name, '${var.lakewatch_catalog}.${var.lakewatch_schema}.genie_')
+            AND s.created_at >= current_timestamp() - INTERVAL 1 HOUR
+        )
+        SELECT
+          severity_rank,
+          severity,
+          regexp_extract(rule_name, '[^.]+$', 0)                     AS rule,
+          get_json_object(context, '$.product')                      AS product,
+          get_json_object(context, '$.conversation_id')              AS conversation_id,
+          get_json_object(context, '$.requester')                    AS requester,
+          get_json_object(context, '$.labels')                       AS labels,
+          get_json_object(context, '$.max_score')                    AS max_score,
+          date_format(event_time, 'yyyy-MM-dd HH:mm')                AS event_utc,
+          alert_id
+        FROM ranked
+        -- An unknown min severity matches nothing rather than everything.
+        WHERE min_rank > 0 AND severity_rank >= min_rank
+        ORDER BY severity_rank DESC, event_time DESC
+      custom_template_format: MARKDOWN
+      custom_summary: "[${bundle.target}] Genie: new Lakewatch signals (${var.lakewatch_email_min_severity}+)"
+      custom_description: |
+        **@ALERT_NAME** is @ALERT_STATUS. Lakewatch signals at or above
+        **${var.lakewatch_email_min_severity}** from the Genie trace monitoring rules, created in
+        the last hour, highest severity first.
+
+        @QUERY_RESULT_TABLE
+
+        **Triage** in Lakewatch: open **Alerts** and find the `alert_id`. The alert's signals carry
+        the rule's runbook, MITRE ATT&CK / ATLAS mapping and an `investigate` query. To walk a
+        session step by step:
+
+        `SELECT * FROM ${var.catalog}.${var.schema}.genie_session_timeline WHERE conversation_id = '<conversation_id>' ORDER BY step_number`
+
+        Alert: @ALERT_URL
+      evaluation:
+        comparison_operator: GREATER_THAN
+        source:
+          name: severity_rank
+          display: severity_rank
+        threshold:
+          value:
+            double_value: 0
+        empty_result_state: OK
+        notification:
+          notify_on_ok: false
+          retrigger_seconds: 1
+          subscriptions:
+            - user_email: ${var.alert_email}
+      schedule:
+        pause_status: ${var.lakewatch_email_pause_status}
+        quartz_cron_schedule: "0 50 * * * ?"
+        timezone_id: UTC

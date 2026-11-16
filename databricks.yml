@@ -108,6 +108,20 @@ variables:
     description: Workspace path of the Lakewatch rule catalog YAML.
     default: ${workspace.file_path}/src/lakewatch/rule_catalog.yml
 
+  # Email digest of new Lakewatch signals (resources/genie_tracing_lakewatch_email.alert.yml).
+  # Lakewatch itself exports alerts to webhook / Jira / ServiceNow / Tines / Slack, not email.
+  alert_email:
+    description: Email address that receives the Lakewatch signal digest.
+    default: ${workspace.current_user.userName}
+  lakewatch_email_min_severity:
+    description: >
+      Lowest signal severity included in the email: Informational, Low, Medium, High or Critical.
+      Any other value sends nothing.
+    default: High
+  lakewatch_email_pause_status:
+    description: PAUSED or UNPAUSED for the email digest's hourly schedule.
+    default: ${var.schedule_pause_status}
+
 # Targets deliberately carry no workspace host or profile: pass `--profile <name>` on the CLI,
 # or add a gitignored databricks.local.yml (see databricks.local.yml.example).
 targets:
