@@ -143,6 +143,7 @@ processing (`CREATE OR REFRESH STREAMING TABLE ... FROM STREAM(...)`).
 | Job `genie_tracing_setup` | `resources/genie_tracing_setup.job.yml` | One-time: `00_setup` → `01_deploy_prompt_guard` and `07_deploy_lakewatch_rules`, parameterised from the bundle variables. Run on demand, and again after editing the rule catalog. |
 | Job `genie_tracing_monitoring` | `resources/genie_tracing_monitoring.job.yml` | ETL → 3 detection notebooks → sessions. Hourly, paused by default. |
 | Lakewatch detection rules | `src/lakewatch/rule_catalog.yml` | 22 rules over `genie_detections` / `genie_sessions`, created through the Lakewatch rules API by `07_deploy_lakewatch_rules` (there is no bundle resource for them). See [Lakewatch detection rules](#lakewatch-detection-rules). |
+| SQL alert "new Lakewatch signals" | `resources/genie_tracing_lakewatch_email.alert.yml` | Hourly email digest of new signals at or above `lakewatch_email_min_severity` from these rules, read from the Lakewatch signals view (Lakewatch itself does not send email). Rule, severity, summary and identifiers only, never prompt text. |
 
 ### Notebooks (`src/notebooks/`, Python source format)
 
@@ -240,6 +241,9 @@ Variables you will most likely override (in `databricks.local.yml` or with `--va
 | `lakewatch_run_as` | deployer | User email or service-principal application ID the rules run as |
 | `lakewatch_schedule` | catalog (`1h`) | Override every rule's schedule (minimum `5m`) |
 | `lakewatch_rules_enabled` | `true` | Create the rules scheduled or unscheduled |
+| `alert_email` | deployer | Who gets the Lakewatch signal email digest |
+| `lakewatch_email_min_severity` | `High` | Lowest severity in the digest (`Informational` … `Critical`; anything else sends nothing) |
+| `lakewatch_email_pause_status` | `schedule_pause_status` | `PAUSED` / `UNPAUSED` for the digest's hourly schedule |
 | `genie_one_services` | `Genie One,data-rooms` | Comma-separated `service_name` values for Genie One spans (see [What the trace contains](#what-the-trace-does-and-does-not-contain)) |
 | `pii_allowlist_files` | `src/config/pii_allowlist.yml` | Comma-separated workspace paths of PII allowlist YAML files, merged (see [Tuning](#tuning)) |
 | `security_patterns_file` | `src/config/security_patterns.yml` | Workspace path of deterministic security signatures, scan limits, and optional runaway thresholds |
@@ -437,6 +441,21 @@ the API cannot be used.
   according to the Lakewatch alert configuration (alerts group by rule and summary, and the summary
   names the conversation).
 
+### Notifications
+
+Lakewatch exports alerts to one destination per catalog (**Settings > Alerts > Delivery**: webhook,
+Jira, ServiceNow, Tines or Slack). It sends every alert, with no severity filter, and does not
+send email. For a SOC, point that export at your ticketing or automation tool.
+
+For email, the bundle deploys a SQL alert, `[<target>] Genie: new Lakewatch signals`, that reads
+`<lakewatch_catalog>.__lakewatch.signals` every hour (at :50) and emails `alert_email` a table of
+the signals created in the last hour at or above `lakewatch_email_min_severity` (default `High`).
+It covers this repo's rules only (`<lakewatch_catalog>.<lakewatch_schema>.genie_*`), lists the
+highest severity first, and includes each signal's `alert_id` so you can open it in Lakewatch. It
+follows `lakewatch_email_pause_status`, so it is paused in `dev` and runs in `prod` unless you
+override it. The alert's owner needs `SELECT` on the signals view. Because it notifies per signal
+rather than per grouped alert, a busy session can appear on several rows.
+
 ## Tuning
 
 * **Presidio**: `pii_threshold`, `ignore_entities` (default ignores `ORGANIZATION`, `DATE_TIME`,
@@ -609,7 +628,8 @@ Verified against live traces in November 2026. These shape what the detectors ca
 │   ├── genie_tracing_etl.pipeline.yml
 │   ├── genie_tracing_sessions.pipeline.yml
 │   ├── genie_tracing_setup.job.yml     one-time setup: 00_setup → 01_deploy_prompt_guard, 07_deploy_lakewatch_rules
-│   └── genie_tracing_monitoring.job.yml
+│   ├── genie_tracing_monitoring.job.yml
+│   └── genie_tracing_lakewatch_email.alert.yml  email digest of new Lakewatch signals
 ├── src/
 │   ├── pipelines/etl/transformations/        genie_turns.sql, genie_tool_calls.sql
 │   ├── pipelines/sessions/transformations/   genie_sessions.sql, genie_session_timeline.sql

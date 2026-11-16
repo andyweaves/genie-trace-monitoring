@@ -520,7 +520,7 @@ LIMIT 100
 # MAGIC
 # MAGIC | Need | Go to |
 # MAGIC |---|---|
-# MAGIC | Be told when something is flagged | Lakewatch signals and alerts from the rules in `src/lakewatch/rule_catalog.yml` (MITRE ATT&CK / ATLAS mapped), deployed by `07_deploy_lakewatch_rules` |
+# MAGIC | Be told when something is flagged | Lakewatch signals and alerts from the rules in `src/lakewatch/rule_catalog.yml` (MITRE ATT&CK / ATLAS mapped), deployed by `07_deploy_lakewatch_rules`; the hourly email digest in `resources/genie_tracing_lakewatch_email.alert.yml` for High+ signals |
 # MAGIC | Tune what becomes a signal, and its severity | `src/lakewatch/rule_catalog.yml`, then re-run the `deploy_lakewatch_rules` task of `genie_tracing_setup` |
 # MAGIC | Tune what counts as PII, and how bad it is | `02_detect_pii`: `pii_threshold`, `ignore_entities`, `pii_weights`; allowlist in `src/config/pii_allowlist*.yml` |
 # MAGIC | Tune prompt-injection sensitivity | `03_detect_prompt_injection`: `prompt_guard_threshold`, `run_ai_classify` |

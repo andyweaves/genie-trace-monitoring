@@ -316,7 +316,7 @@ def _any_of(entries):
 def _investigate(timeline):
     return (
         f"concat('SELECT * FROM {timeline} WHERE conversation_id = ''', conversation_id, "
-        "''' ORDER BY position')"
+        "''' ORDER BY step_number')"
     )
 
 
