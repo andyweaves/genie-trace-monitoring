@@ -3,12 +3,13 @@
 A trust-but-monitor accelerator for Databricks **Genie One** and **Genie Code**, built on the
 Unity Gateway unified trace table. It flattens every Genie turn and tool call into queryable
 tables, runs PII, prompt-injection and guardrail-signal detections over them, rolls the results
-up per session with a severity, and sends one alert listing the sessions worth reviewing.
+up per session with a severity, and promotes the findings to **Lakewatch** detection rules mapped to
+MITRE ATT&CK and ATLAS, so they arrive as signals and alerts in your SIEM workflow.
 
 Everything is a [Databricks Asset Bundle](https://docs.databricks.com/dev-tools/bundles/):
-two serverless Lakeflow pipelines, two jobs (one-time setup and hourly monitoring), one SQL alert,
-seven notebooks, deployable to any
-workspace with a single `databricks bundle deploy`.
+two serverless Lakeflow pipelines, two jobs (one-time setup and hourly monitoring), eight notebooks
+and a catalog of 22 Lakewatch detection rules, deployable to any workspace with a single
+`databricks bundle deploy`.
 
 ## Contents
 
@@ -17,6 +18,7 @@ workspace with a single `databricks bundle deploy`.
 - [What gets built](#what-gets-built)
 - [Quick start](#quick-start)
 - [Detections](#detections)
+- [Lakewatch detection rules](#lakewatch-detection-rules)
 - [Tuning](#tuning)
 - [PII: Presidio and Data Classification](#pii-presidio-and-data-classification)
 - [What the trace does and does not contain](#what-the-trace-does-and-does-not-contain)
@@ -42,10 +44,10 @@ Customers adopting Genie raise three concerns that the product does not answer o
 
 Five stages, left to right: the raw Unity Gateway spans are flattened into turns and tool calls,
 the detectors scan every free-text field and write one row per finding, the session rollup joins
-it all back together per conversation with a `risk_score` and `severity`, and the "sessions to
-review" alert reports sessions with new findings. Dashed boxes are sources the bundle does not
+it all back together per conversation with a `risk_score` and `severity`, and Lakewatch detection
+rules turn new findings into signals and alerts. Dashed boxes are sources the bundle does not
 own; the orange table is the only one written by notebooks rather than a pipeline; green is where
-triage starts; red is the alert. Source SVG: `docs/table_guide_architecture.svg`, rendered by
+triage starts; red is Lakewatch. Source SVG: `docs/table_guide_architecture.svg`, rendered by
 `docs/render_diagram.sh`.
 
 ### What runs when
@@ -53,8 +55,9 @@ triage starts; red is the alert. Source SVG: `docs/table_guide_architecture.svg`
 The hourly job `genie_tracing_monitoring` drives everything. The three detectors run in parallel
 and each only scans text it has not seen before; the guardrail rules re-score their whole lookback
 window so pattern changes update history, and the PII step re-weights existing findings. The
-sessions rollup runs even if a detector failed, and the alert is evaluated last, against the
-finished tables.
+sessions rollup runs even if a detector failed. Lakewatch rules run on their own schedule (hourly by
+default) and read only findings written since their previous run, with a two-hour lookback
+extension to cover the job's run time.
 
 ```mermaid
 flowchart TD
@@ -63,7 +66,7 @@ flowchart TD
     inj["03_detect_prompt_injection<br/><i>ai_query → Prompt Guard 2<br/>+ ai_classify second opinion</i>"]
     gr["04_detect_guardrail_signals<br/><i>rules over outcomes and text</i>"]
     sess["pipeline task<br/>genie_tracing_sessions<br/><i>refresh genie_sessions, timeline</i>"]
-    al["alert task<br/><i>sessions to review,<br/>on the finished tables</i>"]
+    al["Lakewatch rules<br/><i>own hourly schedule,<br/>new findings only</i>"]
 
     etl --> pii
     etl --> inj
@@ -71,7 +74,10 @@ flowchart TD
     pii --> sess
     inj --> sess
     gr --> sess
-    sess --> al
+    sess -.-> al
+    pii -.-> al
+    inj -.-> al
+    gr -.-> al
 
     classDef pipe fill:#f5f7fa,stroke:#1b3139,color:#1b3139
     classDef nb fill:#fff4e5,stroke:#b86e00,color:#1b3139
@@ -92,9 +98,10 @@ flowchart LR
     r["Guardrail rules<br/><i>Action denied:, I dropped …,<br/>USER_REJECTED, …</i>"]
     d["genie_detections<br/><i>detector · flagged · score · label · evidence</i>"]
     s["genie_sessions<br/><i>flags.has_pii / has_prompt_injection /<br/>has_guardrail_signal · risk_score · severity</i>"]
-    a["Alert: sessions to review<br/><i>new findings only,<br/>24 h of context</i>"]
+    a["Lakewatch signal → alert<br/><i>per rule and conversation,<br/>MITRE ATT&CK / ATLAS</i>"]
 
-    text --> p & g & c & r --> d --> s --> a
+    text --> p & g & c & r --> d --> a
+    d --> s --> a
 
     classDef det fill:#fff4e5,stroke:#b86e00,color:#1b3139
     classDef gold fill:#e8f3ec,stroke:#1f7a4d,color:#1b3139
@@ -133,9 +140,9 @@ processing (`CREATE OR REFRESH STREAMING TABLE ... FROM STREAM(...)`).
 | Schema + volume | `resources/genie_tracing.schema.yml` | Target schema and wheel volume |
 | Pipeline `genie_tracing_etl` | `src/pipelines/etl/` | `genie_turns`, `genie_tool_calls` |
 | Pipeline `genie_tracing_sessions` | `src/pipelines/sessions/` | `genie_sessions`, `genie_session_timeline` |
-| Job `genie_tracing_setup` | `resources/genie_tracing_setup.job.yml` | One-time: `00_setup` → `01_deploy_prompt_guard`, parameterised from the bundle variables. Run on demand. |
-| Job `genie_tracing_monitoring` | `resources/genie_tracing_monitoring.job.yml` | ETL → 3 detection notebooks → sessions → alert task. Hourly, paused by default. |
-| SQL alert "sessions to review" | `resources/genie_tracing_alerts.alert.yml` | One digest across PII, prompt injection and guardrail signals: per session `severity`, `risk_score` and the top score per category. Evaluated by the job's alert task (its own schedule stays paused). Triggers only on sessions with a new finding since the previous run; the notification lists those first, then every session flagged in the last `alert_lookback_hours` for context (ids, labels, scores; never prompt text), with links to the tables to investigate. |
+| Job `genie_tracing_setup` | `resources/genie_tracing_setup.job.yml` | One-time: `00_setup` → `01_deploy_prompt_guard` and `07_deploy_lakewatch_rules`, parameterised from the bundle variables. Run on demand, and again after editing the rule catalog. |
+| Job `genie_tracing_monitoring` | `resources/genie_tracing_monitoring.job.yml` | ETL → 3 detection notebooks → sessions. Hourly, paused by default. |
+| Lakewatch detection rules | `src/lakewatch/rule_catalog.yml` | 22 rules over `genie_detections` / `genie_sessions`, created through the Lakewatch rules API by `07_deploy_lakewatch_rules` (there is no bundle resource for them). See [Lakewatch detection rules](#lakewatch-detection-rules). |
 
 ### Notebooks (`src/notebooks/`, Python source format)
 
@@ -148,8 +155,10 @@ processing (`CREATE OR REFRESH STREAMING TABLE ... FROM STREAM(...)`).
 | `04_detect_guardrail_signals.py` | Outcome/wording rules, deterministic security signatures with bounded decoding, and repeated-call / long-turn checks; no new AI calls |
 | `05_session_explorer.py` | Adoption, flagged sessions, session walkthrough, approval flows, tool usage, thumbs-down |
 | `06_table_guide.py` | Guided tour of every table in triage order, with a brief and a runnable query per table. **Start here if you are new to the schema.** |
+| `07_deploy_lakewatch_rules.py` | Validate the Lakewatch rule catalog, preview each rule over recent data, then create / update the rules through the Lakewatch API (`dry_run` prints the YAML for the UI instead) |
 | `_detection_utils.py` | Shared config, `genie_detections` DDL, candidate selection, idempotent MERGE into `genie_detections` (scored once via a staging table; errored rows skipped for retry) |
 | `_security_pattern_utils.py` | Pure-Python deterministic matcher, validated YAML configuration and resource-bounded passive decoding; independently unit tested |
+| `_lakewatch_utils.py` | Pure-Python rule catalog validation, SQL rendering, Lakewatch API payloads and create / update / delete planning; independently unit tested |
 
 `src/sql/access_control.sql` has grants, a workspace row filter, column masks and an ABAC
 policy sketch. Apply them before widening access: **the derived tables contain full prompts,
@@ -164,8 +173,12 @@ responses, SQL and tool results**, readable by anyone with `SELECT`.
    Tracing** previews on in each workspace you want to monitor. Nothing is backfilled.
 2. `SELECT` on the unified trace table, and `USE CATALOG` + `CREATE SCHEMA` on the target catalog
    (the `catalog` variable; it does not have to be the catalog holding the trace table).
-3. An existing **serverless or pro** SQL warehouse for the alert (set `warehouse_name`); job alert
-   tasks do not run on classic warehouses.
+3. **Lakewatch** enabled in the workspace, with a catalog set up for it (`lakewatch_catalog`), and an
+   existing **serverless or pro** SQL warehouse for the detection rules (`warehouse_name`). The
+   principal the rules run as (`lakewatch_run_as`, default: whoever runs the setup job) needs
+   `SELECT` on `genie_detections` and `genie_sessions`. Without Lakewatch, everything except the
+   `deploy_lakewatch_rules` setup task works: findings stay in the tables for triage, but nobody is
+   notified.
 4. For `01_deploy_prompt_guard`, either a Prompt Guard 2 model already registered in Unity
    Catalog (`model_source = uc_model`, no token needed) or a Databricks secret holding a Hugging
    Face token with access to Meta Llama models (`model_source = huggingface`, default scope
@@ -206,10 +219,14 @@ widgets first (they default to `unity_gateway` / `genie_tracing`).
 Then open `src/notebooks/06_table_guide` in the workspace and walk through the tables.
 
 The job deploys **paused**. Unpause it when you are happy with the output
-(`schedule_pause_status: UNPAUSED`, or in the UI). The `prod` target unpauses it for you. The
-alert needs no unpausing: the job evaluates it as its last step, once `genie_sessions` is rebuilt,
-so a session is never checked against a half-refreshed table. A failed detector does not stop the
-session rollup or the alert for what the other detectors found.
+(`schedule_pause_status: UNPAUSED`, or in the UI). The `prod` target unpauses it for you. A failed
+detector does not stop the session rollup for what the other detectors found.
+
+The Lakewatch rules are scheduled as soon as `genie_tracing_setup` creates them (set
+`lakewatch_rules_enabled: "false"` to create them unscheduled). Until the monitoring job runs they
+simply find nothing. The first run of a new deployment promotes everything in the
+`detection_lookback_days` window that the detectors write, so review the backfill before routing
+alerts to an on-call channel.
 
 Variables you will most likely override (in `databricks.local.yml` or with `--var`):
 
@@ -218,16 +235,17 @@ Variables you will most likely override (in `databricks.local.yml` or with `--va
 | `catalog` / `schema` | `unity_gateway` / `genie_tracing` | Where the derived tables live |
 | `source_table` | `unity_gateway.unified_tracing.unity_gateway_otel_spans` | Your unified trace table |
 | `annotations_table` | `..._otel_annotations` | Its feedback sibling |
-| `warehouse_name` | `Serverless Starter Warehouse` | Serverless or pro SQL warehouse for the alert. Looked up by exact name at deploy time, so it usually needs setting per workspace |
+| `warehouse_name` | `Serverless Starter Warehouse` | Serverless or pro SQL warehouse the Lakewatch rules run on. Looked up by exact name at deploy time, so it usually needs setting per workspace |
+| `lakewatch_catalog` / `lakewatch_schema` | `catalog` / `schema` | Where the rules are created: a catalog Lakewatch is set up for, usually with its `detection` folder |
+| `lakewatch_run_as` | deployer | User email or service-principal application ID the rules run as |
+| `lakewatch_schedule` | catalog (`1h`) | Override every rule's schedule (minimum `5m`) |
+| `lakewatch_rules_enabled` | `true` | Create the rules scheduled or unscheduled |
 | `genie_one_services` | `Genie One,data-rooms` | Comma-separated `service_name` values for Genie One spans (see [What the trace contains](#what-the-trace-does-and-does-not-contain)) |
 | `pii_allowlist_files` | `src/config/pii_allowlist.yml` | Comma-separated workspace paths of PII allowlist YAML files, merged (see [Tuning](#tuning)) |
 | `security_patterns_file` | `src/config/security_patterns.yml` | Workspace path of deterministic security signatures, scan limits, and optional runaway thresholds |
 | `prompt_guard_model_source` | `huggingface` | How `genie_tracing_setup` gets the Prompt Guard weights: `huggingface` (secret `hf_secret_scope` / `hf_secret_key`, default `genie_tracing` / `hf_token`) or `uc_model` (`prompt_guard_source_uc_model`) |
 | `prompt_guard_endpoint` | `genie-prompt-guard-2` | Endpoint created by `01_deploy_prompt_guard` |
 | `detection_lookback_days` | `7` | How far back each run re-evaluates |
-| `alert_email` | deployer | Who gets alert notifications |
-| `alert_lookback_hours` | `24` | Hours of flagged sessions listed in each alert notification (the alert still only triggers on new findings) |
-| `workspace_url` | `workspace.host` | Base URL for table links in alert notifications. Set it when the host comes only from `--profile` (it is empty then) |
 
 ## Detections
 
@@ -317,6 +335,108 @@ rejected + 0.2 if a name appears with a date of birth, phone number or location)
 scores about 0.26 (low), a name with a date of birth about 0.7 (medium), a card number 1.0 (high).
 Weights live in `src/pipelines/sessions/transformations/genie_sessions.sql`.
 
+## Lakewatch detection rules
+
+The detectors write findings; [Lakewatch](https://docs.databricks.com/aws/en/lakewatch/) decides
+who hears about them. `src/lakewatch/rule_catalog.yml` defines 22 detection rules that promote
+findings from `genie_detections` (and the composite score in `genie_sessions`) into Lakewatch
+signals and alerts. Each rule has a severity, fidelity, category, MITRE ATT&CK and ATLAS mappings,
+OWASP and DASF annotations, an objective and a Markdown runbook. The notebooks stay the detection
+engine: decoding, Prompt Guard, Presidio and the red-team tuning all stay where they are, and the
+rules decide what becomes a signal and how it is classified.
+
+### How the rules work
+
+* **One signal per (rule, conversation)** per run, never one per finding. Context carries
+  `conversation_id`, `requester`, `product`, `workspace_id`, `labels`, `detectors`, `fields`,
+  `tools`, `hit_count`, `turn_count`, `max_score`, up to ten `trace_ids`, and `investigate`, a
+  ready-made query over `genie_session_timeline`. **No prompt, response, argument or result text**
+  reaches a signal: the renderer rejects any rule that selects a free-text column or an evidence
+  key other than `source_field`, `tool_name` or `entities`.
+* **New findings only.** Rules filter on `IN_TIMERANGE(detected_at)`. `detected_at` only moves when
+  a finding appears or its score rises, so the hourly re-scan does not re-signal. `extend_lookback:
+  2h` covers the monitoring job's run time, and 24-hour deduplication absorbs the overlap.
+* **Three kinds of rule.** `match` rules select findings by detector, label, source field and score.
+  `genie_injection_then_action` is a `sequence`: an injection finding followed in the same
+  conversation by exfiltration, secret access, privilege change, obfuscated execution or a
+  destructive action, searched over seven days. It is the one to page on. `genie_pii_combination`
+  (a name with a date of birth, phone number or location) and `genie_high_risk_session`
+  (`risk_score` ≥ 0.8, the replacement for the old "sessions to review" SQL alert) are `custom` SQL.
+* **Taxonomies.** `mitre-attack` uses Enterprise ATT&CK v20 tactic names (Stealth and Defense
+  Impairment replaced Defense Evasion). `mitre-atlas` uses ATLAS 5.6, which has agent-specific
+  techniques such as AML.T0086 *Exfiltration via AI Agent Tool Invocation* and AML.T0101 *Data
+  Destruction via AI Agent Tool Invocation*. Frameworks go in `annotations` (`owasp_llm_top10`,
+  `owasp_agentic_top10`, `dasf_risks`, `mitre_techniques`) and are repeated in the objective.
+  `tests/verify_mitre_mappings.py` checks every ID, name and tactic against the published MITRE data.
+
+| Rule | Severity | Fidelity | ATT&CK | ATLAS | OWASP | DASF |
+|---|---|---|---|---|---|---|
+| `genie_credential_exposed` | High | High | T1552, T1552.004 | AML.T0055, AML.T0057 | LLM02 | 13.19, 10.6 |
+| `genie_agent_secret_access` | Medium | Investigative | T1528, T1552.001, T1555.006 | AML.T0083, AML.T0098 | LLM06, ASI02, ASI03 | 13.2, 13.19 |
+| `genie_secret_disclosure_attempt` | High | Medium | T1027, T1552 | AML.T0057, AML.T0098 | LLM02, LLM06, ASI03 | 13.19 |
+| `genie_direct_prompt_injection` | Medium | Medium | – | AML.T0051.000, AML.T0054 | LLM01, ASI01 | 9.1 |
+| `genie_indirect_prompt_injection` | High | Medium | – | AML.T0051.001, AML.T0080, AML.T0099 | LLM01, ASI01 | 13.16, 13.24, 9.1 |
+| `genie_system_prompt_extraction` | Low | Investigative | – | AML.T0056, AML.T0069.002 | LLM07 | 9.1 |
+| `genie_jailbreak_attempt` | Low | Investigative | – | AML.T0054 | LLM01, ASI01 | 9.1 |
+| `genie_markdown_image_exfil` | High | Medium | T1567 | AML.T0057, AML.T0077 | LLM05, LLM02, ASI01 | 13.23, 10.2 |
+| `genie_external_data_send` | Medium | Investigative | T1048, T1567 | AML.T0086 | LLM06, ASI02 | 13.23, 13.2 |
+| `genie_cloud_storage_exfil` | High | Medium | T1537, T1567.002 | AML.T0086 | LLM06, ASI02 | 13.23, 13.22 |
+| `genie_obfuscated_execution` | High | Medium | T1027, T1059.001, T1059.004, T1059.006, T1140 | AML.T0053 | ASI05 | 13.11 |
+| `genie_destructive_action` | High | Medium | T1070.004, T1485 | AML.T0101 | LLM06, ASI02 | 13.2 |
+| `genie_sensitive_tool_action` | Low | Investigative | – | AML.T0053 | LLM06, ASI02 | 13.2 |
+| `genie_privilege_change` | Medium | Investigative | T1098, T1098.003, T1222 | AML.T0053 | LLM06, ASI03 | 13.3, 13.22 |
+| `genie_guardrail_block` | Medium | High | – | AML.T0053, AML.T0054 | LLM06, ASI02 | 13.2 |
+| `genie_runaway_agent` | Low | Investigative | T1496 | AML.T0029, AML.T0034.002 | LLM10 | 13.4, 9.4 |
+| `genie_discovery_enumeration` | Informational | Investigative | T1069.003, T1087.004, T1580, T1619 | AML.T0075 | ASI02 | 13.2 |
+| `genie_sensitive_pii` | High | Medium | – | AML.T0057 | LLM02 | 9.10, 10.6 |
+| `genie_personal_data` | Low | Investigative | – | AML.T0057 | LLM02 | 9.10 |
+| `genie_pii_combination` | Medium | Investigative | – | AML.T0057 | LLM02 | 9.10 |
+| `genie_injection_then_action` | Critical | High | – | AML.T0051, AML.T0053, AML.T0086, AML.T0098, AML.T0101 | LLM01, LLM06, ASI01, ASI02 | 13.6, 13.17, 13.23 |
+| `genie_high_risk_session` | High | Medium | – | – | LLM01, LLM02, LLM06 | 10.1 |
+
+`not_signalled` in the catalog lists the informational detector outputs deliberately left out
+(`approval_requested`, `turn_error`, `tool_error`, `cancelled_or_aborted`, `security_scan_limited`,
+`trace_completeness_warning`, `markdown_data_image`). `tests/test_lakewatch_rules.py` fails if a
+guardrail rule or security signature is neither covered by a rule nor listed there, and if the
+catalog names a label the detectors never write.
+
+On the red-team trace set (44 RT attack cases, 30 BN benign controls), rules above Informational
+signalled 39 RT and 4 BN cases: a PAT-shaped value (`genie_credential_exposed`), a non-allowlisted
+URL (`genie_external_data_send`), a sensitive-argument keyword (`genie_sensitive_tool_action`), and
+one prompt that Prompt Guard and the LLM judge both scored as an injection. The
+Critical `genie_injection_then_action` fired only on RT cases. RT labels cover attack types these
+detectors do not target, so the RT fraction is not a recall measure.
+
+### Deploying and changing rules
+
+There is no bundle resource for Lakewatch rules, so `genie_tracing_setup` runs
+`07_deploy_lakewatch_rules`. It validates the catalog (against the categories configured for the
+Lakewatch catalog), then creates or updates each rule by name through the Lakewatch rules API
+(`/api/2.0/lakewatch/rules`, Beta). Unchanged rules (same `content_hash` annotation) are skipped.
+Updates use an `update_mask` limited to the fields the notebook owns, so an analyst's suppression
+survives a redeploy. Every rule is annotated `managed_by: genie-trace-monitoring`, and only rules
+with that annotation are pruned (`prune = true`, interactive runs only).
+
+```bash
+# After editing src/lakewatch/rule_catalog.yml
+databricks bundle deploy -t dev
+databricks bundle run genie_tracing_setup -t dev --only deploy_lakewatch_rules
+```
+
+Run the notebook by hand with `mode = dry_run` to preview each rule over the last `preview_days`
+(signals, hits and requesters it would have produced) and print the YAML that the Lakewatch UI
+accepts under **Detection rules > Create detection rule > Edit as YAML**. That is a fallback where
+the API cannot be used.
+
+* **Tune a rule** by editing its `match` (labels, `fields`, `min_score`), severity or fidelity, then
+  redeploy. Add a new signature to `security_patterns.yml` and the coverage test will tell you to
+  map it to a rule.
+* **Silence a rule** in the Lakewatch UI (suppression is kept across redeploys), or remove it from
+  the catalog and run with `prune = true`.
+* Signals land in `<lakewatch_catalog>.__lakewatch.signals`, and each opens or joins an alert
+  according to the Lakewatch alert configuration (alerts group by rule and summary, and the summary
+  names the conversation).
+
 ## Tuning
 
 * **Presidio**: `pii_threshold`, `ignore_entities` (default ignores `ORGANIZATION`, `DATE_TIME`,
@@ -370,7 +490,7 @@ own, because it works at the **column** level.
 |---|---|---|
 | Which session, turn and field contained PII | ✅ one finding per span and field | ❌ which *column* has contained PII |
 | `has_pii`, `severity`, `risk_score` per session | ✅ | ❌ |
-| "Sessions to review" alert on new PII | ✅ every hourly run | ❌ |
+| Lakewatch signal and alert on new PII | ✅ every hourly run | ❌ |
 | Severity weighting (card ≫ name), name + date-of-birth bonus | ✅ | ❌ |
 | Governed `class.*` tags for ABAC | ✅ on the five scanned columns | ✅ on the columns it classifies, including raw payload copies |
 | Freshness | Hourly | Background scan, new columns typically within 24 hours |
@@ -383,7 +503,7 @@ conversation just did".
 
 ### Recommended: use both
 
-* **Presidio** for monitoring: row-level findings, session severity and the alert.
+* **Presidio** for monitoring: row-level findings, session severity and the Lakewatch PII rules.
 * **Data Classification** for tag coverage. `02_detect_pii` only tags the columns it scans
   (`prompt`, `response`, `tool_arguments`, `tool_result`, `response_text`); the same text is also
   in `input_messages_raw`, `output_messages_raw`, the `attributes` VARIANT and
@@ -411,8 +531,8 @@ For a deployment that will not run Presidio:
 * Remove the `detect_pii` task from `resources/genie_tracing_monitoring.job.yml`, and from
   `sessions_pipeline`'s `depends_on`. The spaCy wheel (prerequisite 5) and the `detections`
   environment are then no longer needed.
-* `has_pii` stays false, PII contributes nothing to `risk_score`, and the "sessions to review"
-  alert covers prompt injection and guardrail signals only. PII becomes a **governance control**
+* `has_pii` stays false, PII contributes nothing to `risk_score`, and the Lakewatch PII rules
+  (`genie_sensitive_pii`, `genie_personal_data`, `genie_pii_combination`) never fire. PII becomes a **governance control**
   (tag, then mask with ABAC) rather than a monitored signal.
 * `genie_session_timeline` and `genie_detections` no longer show PII; use Catalog Explorer or
   `system.data_classification.results` to see which columns have carried it.
@@ -488,14 +608,14 @@ Verified against live traces in November 2026. These shape what the detectors ca
 │   ├── genie_tracing.schema.yml       schema + wheel volume
 │   ├── genie_tracing_etl.pipeline.yml
 │   ├── genie_tracing_sessions.pipeline.yml
-│   ├── genie_tracing_setup.job.yml     one-time setup: 00_setup → 01_deploy_prompt_guard
-│   ├── genie_tracing_monitoring.job.yml
-│   └── genie_tracing_alerts.alert.yml "sessions to review" alert
+│   ├── genie_tracing_setup.job.yml     one-time setup: 00_setup → 01_deploy_prompt_guard, 07_deploy_lakewatch_rules
+│   └── genie_tracing_monitoring.job.yml
 ├── src/
 │   ├── pipelines/etl/transformations/        genie_turns.sql, genie_tool_calls.sql
 │   ├── pipelines/sessions/transformations/   genie_sessions.sql, genie_session_timeline.sql
 │   ├── config/                               PII allowlists + deterministic security signatures
-│   ├── notebooks/                            00 … 06 + shared detection / security helpers, images/
+│   ├── lakewatch/rule_catalog.yml            Lakewatch detection rules: SQL, MITRE, frameworks, runbooks
+│   ├── notebooks/                            00 … 07 + shared detection / security / Lakewatch helpers, images/
 │   └── sql/access_control.sql
 ├── tests/                                    local regressions + content-free trace scorecard
 └── docs/

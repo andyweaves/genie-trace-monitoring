@@ -29,8 +29,8 @@
   <text x="660" y="42" text-anchor="middle" class="sub">job tasks 02 PII · 03 injection · 04 guardrails</text>
   <text x="920" y="26" text-anchor="middle" class="col">4 · Roll up</text>
   <text x="920" y="42" text-anchor="middle" class="sub">pipeline genie_tracing_sessions</text>
-  <text x="1180" y="26" text-anchor="middle" class="col">5 · Alert</text>
-  <text x="1180" y="42" text-anchor="middle" class="sub">job task, after the roll up</text>
+  <text x="1180" y="26" text-anchor="middle" class="col">5 · Lakewatch</text>
+  <text x="1180" y="42" text-anchor="middle" class="sub">detection rules, own hourly schedule</text>
 
   <!-- column 1 -->
   <rect x="30" y="70" width="200" height="90" class="box src"/>
@@ -75,10 +75,10 @@
 
   <!-- column 5 -->
   <rect x="1080" y="120" width="200" height="90" class="box alert"/>
-  <text x="1180" y="145" text-anchor="middle" class="name">sessions to review</text>
-  <text x="1180" y="165" text-anchor="middle" class="desc">SQL alert · fires on new findings</text>
-  <text x="1180" y="181" text-anchor="middle" class="desc">new sessions first, then by risk</text>
-  <text x="1180" y="197" text-anchor="middle" class="desc">plus the last 24 h for context</text>
+  <text x="1180" y="145" text-anchor="middle" class="name">Lakewatch rules</text>
+  <text x="1180" y="165" text-anchor="middle" class="desc">22 rules · new findings only</text>
+  <text x="1180" y="181" text-anchor="middle" class="desc">MITRE ATT&amp;CK + ATLAS · runbooks</text>
+  <text x="1180" y="197" text-anchor="middle" class="desc">1 signal per rule + session → alert</text>
 
   <!-- edges: source -> flatten -->
   <path d="M230,105 L300,105" class="edge"/>
@@ -91,8 +91,12 @@
   <!-- edges: detect -> roll up -->
   <path d="M760,165 L820,165" class="edge"/>
 
-  <!-- edge: roll up -> alert -->
+  <!-- edge: roll up -> Lakewatch (composite risk rule) -->
   <path d="M1020,165 L1080,165" class="edge"/>
+
+  <!-- edge: detections -> Lakewatch (most rules) -->
+  <path d="M760,200 C790,200 790,255 820,255 L1150,255 C1180,255 1180,235 1180,212" class="edge"/>
+  <text x="1000" y="249" text-anchor="middle" class="lbl">most rules read genie_detections</text>
 
   <!-- edges: flatten -> sessions (around detections) -->
   <path d="M500,85 L790,85 C805,85 805,150 820,150" class="edge"/>
@@ -115,5 +119,5 @@
   <rect x="720" y="392" width="14" height="10" class="box gold"/>
   <text x="740" y="401" class="lbl">triage entry point (start here)</text>
   <rect x="980" y="392" width="14" height="10" class="box alert"/>
-  <text x="1000" y="401" class="lbl">SQL alert, evaluated by the job</text>
+  <text x="1000" y="401" class="lbl">Lakewatch detection rules (signals, alerts)</text>
 </svg>

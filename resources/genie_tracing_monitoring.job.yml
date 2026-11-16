@@ -4,8 +4,8 @@ resources:
       name: "[${bundle.target}] genie_tracing_monitoring"
       description: >
         Flattens Genie One / Genie Code traces, runs PII, prompt-injection and guardrail-signal
-        detections, rebuilds the session rollups, then evaluates the "sessions to review" SQL alert
-        against the finished tables.
+        detections and rebuilds the session rollups. Lakewatch detection rules (deployed by
+        genie_tracing_setup) turn the findings into signals and alerts.
 
       schedule:
         quartz_cron_expression: "0 15 * * * ?" # hourly at :15
@@ -84,12 +84,3 @@ resources:
           run_if: ALL_DONE
           pipeline_task:
             pipeline_id: ${resources.pipelines.genie_tracing_sessions.id}
-
-        # The alert runs last so genie_sessions is fully rebuilt first, and only if that rebuild
-        # succeeded (default run_if). Notifications go to the alert's own subscribers.
-        - task_key: alert_sessions_to_review
-          depends_on:
-            - task_key: sessions_pipeline
-          alert_task:
-            alert_id: ${resources.alerts.genie_sessions_to_review.id}
-            warehouse_id: ${var.warehouse_id}

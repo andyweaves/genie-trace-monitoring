@@ -69,14 +69,14 @@ variables:
   detection_lookback_days:
     default: "7"
 
-  # SQL warehouse used by alerts, resolved by name at deploy time.
+  # SQL warehouse the Lakewatch detection rules run on, resolved by name at deploy time.
   warehouse_name:
     description: >
-      Name of an existing serverless or pro SQL warehouse to run the alert on. The lookup fails at
-      deploy time if no warehouse has this exact name, so set it per workspace.
+      Name of an existing serverless or pro SQL warehouse for the Lakewatch detection rules. The
+      lookup fails at deploy time if no warehouse has this exact name, so set it per workspace.
     default: Serverless Starter Warehouse
   warehouse_id:
-    description: SQL warehouse ID for alerts (looked up from warehouse_name).
+    description: SQL warehouse ID for the Lakewatch rules (looked up from warehouse_name).
     lookup:
       warehouse: ${var.warehouse_name}
 
@@ -84,22 +84,29 @@ variables:
   schedule_pause_status:
     default: PAUSED
 
-  alert_email:
-    description: Email address that receives alert notifications.
-    default: ${workspace.current_user.userName}
-
-  alert_lookback_hours:
+  # Lakewatch detection rules (src/lakewatch/rule_catalog.yml), deployed by genie_tracing_setup.
+  lakewatch_catalog:
     description: >
-      How many hours of flagged sessions each alert notification lists. Alerts only trigger when a
-      session got a new finding since the previous (hourly) job run; older rows are context.
-    default: "24"
-
-  workspace_url:
+      Unity Catalog catalog Lakewatch is set up for; the rules are created there. Defaults to the
+      bundle catalog.
+    default: ${var.catalog}
+  lakewatch_schema:
+    description: Schema for the rules in lakewatch_catalog (Lakewatch's default folder is usually `detection`).
+    default: ${var.schema}
+  lakewatch_run_as:
     description: >
-      Base URL of the workspace (https://...), used for the table links in alert notifications.
-      Defaults to workspace.host, which is empty when the host comes only from a CLI profile; set it
-      in databricks.local.yml or with --var in that case.
-    default: ${workspace.host}
+      User email or service-principal application ID the rules run as. Blank = whoever runs the
+      setup job. That principal needs SELECT on genie_detections and genie_sessions.
+    default: ""
+  lakewatch_schedule:
+    description: Override every rule's schedule (e.g. 1h, 15m; minimum 5m). Blank = the catalog's.
+    default: ""
+  lakewatch_rules_enabled:
+    description: Whether deployed rules are scheduled ("true" / "false").
+    default: "true"
+  lakewatch_rule_catalog_file:
+    description: Workspace path of the Lakewatch rule catalog YAML.
+    default: ${workspace.file_path}/src/lakewatch/rule_catalog.yml
 
 # Targets deliberately carry no workspace host or profile: pass `--profile <name>` on the CLI,
 # or add a gitignored databricks.local.yml (see databricks.local.yml.example).

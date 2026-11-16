@@ -2,22 +2,31 @@
 #
 #   databricks bundle run genie_tracing_setup -t <target>
 #
-# Runs 00_setup (source check, detections table, spaCy wheel) then 01_deploy_prompt_guard with
-# parameters taken from the bundle variables, so neither notebook's widgets need editing by hand.
-# Safe to re-run: 00 is idempotent and 01 registers a new model version and updates the endpoint.
+# Runs 00_setup (source check, detections table, spaCy wheel), then 01_deploy_prompt_guard and
+# 07_deploy_lakewatch_rules, with parameters taken from the bundle variables, so no notebook's
+# widgets need editing by hand. Safe to re-run: 00 is idempotent, 01 registers a new model version
+# and updates the endpoint, and 07 creates or updates rules by name (unchanged rules are skipped).
+#
+# To redeploy only the Lakewatch rules after editing src/lakewatch/rule_catalog.yml:
+#
+#   databricks bundle deploy -t <target>
+#   databricks bundle run genie_tracing_setup -t <target> --only deploy_lakewatch_rules
 resources:
   jobs:
     genie_tracing_setup:
       name: "[${bundle.target}] genie_tracing_setup"
       description: >
         One-time setup for Genie trace monitoring: checks the source trace table, creates the
-        detections table, stages the spaCy wheel for Presidio, and deploys the Llama Prompt Guard 2
-        serving endpoint used by the prompt-injection detector.
+        detections table, stages the spaCy wheel for Presidio, deploys the Llama Prompt Guard 2
+        serving endpoint used by the prompt-injection detector, and creates or updates the
+        Lakewatch detection rules.
 
       environments:
         - environment_key: base
           spec:
             environment_version: "4"
+            dependencies:
+              - pyyaml>=6
 
       tasks:
         - task_key: setup
@@ -51,3 +60,26 @@ resources:
               source_uc_model: ${var.prompt_guard_source_uc_model}
               hf_secret_scope: ${var.hf_secret_scope}
               hf_secret_key: ${var.hf_secret_key}
+
+        # Creates or updates the Lakewatch detection rules in src/lakewatch/rule_catalog.yml through
+        # the Lakewatch rules API (no bundle resource exists for them). Needs Lakewatch enabled in
+        # the workspace and lakewatch_catalog set to a Lakewatch catalog. Rules not in the catalog
+        # are left alone; run the notebook with prune = true to delete retired ones.
+        - task_key: deploy_lakewatch_rules
+          depends_on:
+            - task_key: setup
+          environment_key: base
+          notebook_task:
+            notebook_path: ../src/notebooks/07_deploy_lakewatch_rules.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${resources.schemas.genie_tracing.name}
+              lakewatch_catalog: ${var.lakewatch_catalog}
+              lakewatch_schema: ${var.lakewatch_schema}
+              warehouse_id: ${var.warehouse_id}
+              rule_catalog_file: ${var.lakewatch_rule_catalog_file}
+              run_as_principal: ${var.lakewatch_run_as}
+              schedule: ${var.lakewatch_schedule}
+              enabled: ${var.lakewatch_rules_enabled}
+              mode: deploy
+              preview_days: "0"

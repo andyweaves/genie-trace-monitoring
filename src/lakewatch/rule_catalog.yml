@@ -1,0 +1,847 @@
+# Lakewatch detection rules for Genie trace monitoring.
+#
+# Each rule promotes findings that the hourly genie_tracing_monitoring job has already written to
+# genie_detections (PII, Prompt Guard, ai_classify, guardrail outcomes and the deterministic
+# security signatures) into Lakewatch signals, with MITRE ATT&CK / ATLAS mappings, framework
+# annotations and a runbook. The notebooks stay the detection engine: decoding, ML scoring and
+# tuning live there; these rules decide what becomes a signal and how it is classified.
+#
+# 07_deploy_lakewatch_rules renders this file through _lakewatch_utils and upserts each rule with
+# the Lakewatch rules API. tests/test_lakewatch_rules.py checks that every flagged guardrail rule
+# and security signature is covered by a rule here or listed in `not_signalled`.
+#
+# Rule kinds:
+#   match     (default) findings matching any `match` entry, grouped to one signal per conversation
+#   sequence  a `first` finding followed by a `then` finding in the same conversation
+#   custom    `query` written by hand; placeholders {detections}, {sessions}, {timeline}
+#
+# `match` entries: detector (required), labels (optional, default: any), exclude_labels,
+# fields (source field: prompt | response | tool_arguments | tool_result | model_output |
+# embedded_tool_result), min_score, include_unflagged (default false).
+#
+# MITRE taxonomies: `mitre-attack` (Enterprise ATT&CK v20) and `mitre-atlas` (ATLAS 5.6).
+# Signals carry identifiers, labels and scores only, never prompt, response or argument text.
+version: 1
+
+defaults:
+  schedule: 1h
+  # The monitoring job runs hourly at :15 and writes detected_at when its MERGE finishes, so a
+  # rule window has to reach back over a full job run. Overlap is absorbed by deduplication.
+  extend_lookback: 2h
+  deduplication: DEDUPLICATION_ENABLED
+  deduplication_time_window: 24h
+
+# Detector outputs that are deliberately not promoted to signals: they are informational in
+# genie_detections (no session flag, no risk score) and would only add noise.
+not_signalled:
+  guardrail_signal:
+    - approval_requested          # the approval guardrail working as designed
+    - turn_error
+    - tool_error
+    - cancelled_or_aborted
+    - security_scan_limited       # coverage marker, not a finding
+    - trace_completeness_warning  # missing telemetry, not evidence of misuse
+    - markdown_data_image         # inline data: image, no destination
+
+rules:
+  # ---------------------------------------------------------------------------------------------
+  # Credential access and exposure
+  # ---------------------------------------------------------------------------------------------
+  - name: genie_credential_exposed
+    description: A credential-shaped value (PAT, cloud key, token, private key) appeared in a Genie prompt, answer or tool output.
+    summary: "Credential-shaped value in {product} session {conversation_id} ({requester})"
+    severity: High
+    fidelity: FIDELITY_HIGH
+    category: Static Signature
+    match:
+      - detector: guardrail_signal
+        labels: [credential_databricks_pat, credential_aws_access_key, credential_github_token,
+                 credential_slack_token, credential_jwt, credential_private_key, credential_google_api_key]
+    mitre:
+      - {taxonomy: mitre-attack, tactic: Credential Access, technique_id: T1552, technique: Unsecured Credentials}
+      - {taxonomy: mitre-attack, tactic: Credential Access, technique_id: T1552, technique: Unsecured Credentials,
+         sub_technique_id: T1552.004, sub_technique: Private Keys}
+      - {taxonomy: mitre-atlas, tactic: Credential Access, technique_id: AML.T0055, technique: Unsecured Credentials}
+      - {taxonomy: mitre-atlas, tactic: Exfiltration, technique_id: AML.T0057, technique: LLM Data Leakage}
+    frameworks:
+      owasp_llm: [LLM02:2025 Sensitive Information Disclosure]
+      dasf: [13.19 Credential and Token Exposure, 10.6 Sensitive data output from a model]
+    objective: |
+      Detects provider-specific credential formats (Databricks PAT, AWS access key, GitHub and
+      Slack tokens, JWT, PEM private key, Google API key) in any Genie text field, including base64,
+      hex and URL-encoded forms decoded by the bounded passive decoder in
+      04_detect_guardrail_signals. The source field tells you the direction: in a prompt the user
+      handed the credential to the model; in a tool result or answer the agent read or echoed one.
+      Credentials sent to the LLM leave the workspace boundary for the model provider.
+    triage:
+      - "Check `fields`. `tool_result` / `embedded_tool_result` / `model_output` means the agent retrieved it from data or a tool; `prompt` means the user pasted it; `response` means the model repeated it."
+      - "Run `investigate` to see the turn order and which tool produced the value. The detection never stores the value itself."
+      - "For Databricks PATs, list the requester's tokens in the token-management API and compare creation dates."
+    false_positives:
+      - "Documentation or test fixtures with realistic-looking keys."
+      - "Model-generated example keys. These still match, because the model may be echoing a real one."
+    response:
+      - "Treat the credential as compromised. Revoke and rotate it at the issuer."
+      - "If it came from table data, find and clean the source table and restrict who can read it."
+      - "Remind the requester not to paste secrets into Genie, and point them at secret scopes."
+
+  - name: genie_agent_secret_access
+    description: A Genie Code tool call read a secret scope, credential file, credential environment variable or the token API.
+    summary: "Agent secret access in {product} session {conversation_id} ({requester})"
+    severity: Medium
+    fidelity: FIDELITY_INVESTIGATIVE
+    category: Static Signature
+    match:
+      - detector: guardrail_signal
+        labels: [secret_lookup_sql, secret_lookup_dbutils, credential_file_read,
+                 credential_environment_read, credential_token_api]
+    mitre:
+      - {taxonomy: mitre-attack, tactic: Credential Access, technique_id: T1555, technique: Credentials from Password Stores,
+         sub_technique_id: T1555.006, sub_technique: Cloud Secrets Management Stores}
+      - {taxonomy: mitre-attack, tactic: Credential Access, technique_id: T1552, technique: Unsecured Credentials,
+         sub_technique_id: T1552.001, sub_technique: Credentials In Files}
+      - {taxonomy: mitre-attack, tactic: Credential Access, technique_id: T1528, technique: Steal Application Access Token}
+      - {taxonomy: mitre-atlas, tactic: Credential Access, technique_id: AML.T0098, technique: AI Agent Tool Credential Harvesting}
+      - {taxonomy: mitre-atlas, tactic: Credential Access, technique_id: AML.T0083, technique: Credentials from AI Agent Configuration}
+    frameworks:
+      owasp_llm: [LLM06:2025 Excessive Agency]
+      owasp_agentic: [ASI02 Tool Misuse and Exploitation, ASI03 Identity and Privilege Abuse]
+      dasf: [13.2 Tool Misuse, 13.19 Credential and Token Exposure]
+    objective: |
+      Detects tool arguments that read credentials: SQL secret(), dbutils.secrets.get, reading
+      .databrickscfg / .env / cloud credential files, os.environ lookups of well-known token
+      variables, and calls to the token / token-management API. These only appear in executed tool
+      calls, not in approval proposals. A secret read is often legitimate in notebooks, but an agent
+      reading one during a chat, particularly after untrusted content entered the context, is how
+      credential harvesting through an agent looks.
+    triage:
+      - "Check whether the requester normally uses this secret scope (`system.access.audit`, `secrets` service)."
+      - "Look for a prompt-injection or indirect-injection signal in the same session (see genie_injection_then_action)."
+      - "Run `investigate` and check whether the value went on to an answer, an HTTP call or a file."
+    false_positives:
+      - "Notebooks and jobs that read their own connection secrets."
+      - "Users asking Genie Code to debug authentication code."
+    response:
+      - "If the read was not requested by the user, rotate the secret and review ACLs on the scope."
+      - "Restrict READ on the scope to the service principals that need it."
+
+  - name: genie_secret_disclosure_attempt
+    description: A request to print or reveal secrets, bypass redaction, or encode a secret value.
+    summary: "Secret disclosure attempt in {product} session {conversation_id} ({requester})"
+    severity: High
+    fidelity: FIDELITY_MEDIUM
+    category: Fuzzy Signature
+    match:
+      - detector: guardrail_signal
+        labels: [secret_disclosure_request, secret_redaction_bypass, secret_encoding_operation]
+    mitre:
+      - {taxonomy: mitre-attack, tactic: Credential Access, technique_id: T1552, technique: Unsecured Credentials}
+      - {taxonomy: mitre-attack, tactic: Stealth, technique_id: T1027, technique: Obfuscated Files or Information}
+      - {taxonomy: mitre-atlas, tactic: Credential Access, technique_id: AML.T0098, technique: AI Agent Tool Credential Harvesting}
+      - {taxonomy: mitre-atlas, tactic: Exfiltration, technique_id: AML.T0057, technique: LLM Data Leakage}
+    frameworks:
+      owasp_llm: [LLM02:2025 Sensitive Information Disclosure, LLM06:2025 Excessive Agency]
+      owasp_agentic: [ASI03 Identity and Privilege Abuse]
+      dasf: [13.19 Credential and Token Exposure]
+    objective: |
+      Detects intent to get a secret past Databricks secret redaction: prompts asking to print or
+      reveal secret values, API keys or passwords, or to bypass redaction, and code that base64- or
+      hex-encodes a dbutils secret or environment variable (the standard way around redaction).
+      The encoding operation is the strongest signal of the three.
+    triage:
+      - "If `labels` includes `secret_encoding_operation`, check whether the call ran (tool outcome in `investigate`)."
+      - "Check whether the answer or a later tool call carried an encoded string."
+    false_positives:
+      - "Security teams testing redaction, or users asking how redaction works."
+    response:
+      - "Rotate any secret that was encoded and output. Tighten scope ACLs."
+      - "Escalate deliberate bypass attempts to the requester's manager or the insider-risk process."
+
+  # ---------------------------------------------------------------------------------------------
+  # Prompt injection and jailbreak
+  # ---------------------------------------------------------------------------------------------
+  - name: genie_direct_prompt_injection
+    description: The user's own prompt contains a prompt-injection or jailbreak attempt (Prompt Guard, LLM judge or instruction-override signature).
+    summary: "Direct prompt injection in {product} session {conversation_id} ({requester})"
+    severity: Medium
+    fidelity: FIDELITY_MEDIUM
+    category: Learning (AI/ML)
+    match:
+      - detector: prompt_injection_prompt_guard
+        fields: [prompt]
+      - detector: prompt_injection_ai_classify
+        fields: [prompt]
+      - detector: guardrail_signal
+        labels: [instruction_override]
+      - detector: guardrail_signal
+        labels: [role_override_marker]
+        fields: [prompt, tool_arguments]
+    mitre:
+      - {taxonomy: mitre-atlas, tactic: Execution, technique_id: AML.T0051, technique: LLM Prompt Injection,
+         sub_technique_id: AML.T0051.000, sub_technique: Direct}
+      - {taxonomy: mitre-atlas, tactic: Privilege Escalation, technique_id: AML.T0054, technique: LLM Jailbreak}
+      - {taxonomy: mitre-atlas, tactic: Defense Evasion, technique_id: AML.T0054, technique: LLM Jailbreak}
+    frameworks:
+      owasp_llm: [LLM01:2025 Prompt Injection]
+      owasp_agentic: [ASI01 Agent Goal Hijack]
+      dasf: [9.1 Prompt inject]
+    objective: |
+      Detects jailbreak and instruction-override phrasing typed by the user: Llama Prompt Guard 2
+      MALICIOUS above the configured threshold, the ai_classify judge's "prompt injection or
+      jailbreak attempt", "ignore previous instructions"-style overrides and chat-template role
+      markers. A direct injection is the authenticated user attacking the assistant's controls, so
+      the actor is known; what matters is whether it succeeded.
+    triage:
+      - "Check `detectors`. Prompt Guard together with the LLM judge or a signature is high confidence; Prompt Guard alone on long prompts is noisier."
+      - "Run `investigate` and check whether the next turn refused, asked for approval, or executed a tool."
+      - "Check for a genie_destructive_action, genie_external_data_send or genie_agent_secret_access signal in the same session."
+    false_positives:
+      - "Red-team and security testing."
+      - "Prompts that quote injection examples, for example when writing detection content."
+    response:
+      - "If the assistant complied, treat the follow-on actions as the incident."
+      - "Otherwise, record it as a policy breach for the requester and watch for repeats."
+
+  - name: genie_indirect_prompt_injection
+    description: Instructions planted in table data, tool output or a model output tried to take over the agent.
+    summary: "Indirect prompt injection in {product} session {conversation_id} ({requester})"
+    severity: High
+    fidelity: FIDELITY_MEDIUM
+    category: Learning (AI/ML)
+    match:
+      - detector: prompt_injection_prompt_guard
+        fields: [tool_result, model_output]
+      - detector: prompt_injection_ai_classify
+        fields: [tool_result, model_output]
+      - detector: guardrail_signal
+        labels: [indirect_instruction_override, injection_recognised]
+      - detector: guardrail_signal
+        labels: [role_override_marker]
+        fields: [tool_result, embedded_tool_result, model_output]
+    mitre:
+      - {taxonomy: mitre-atlas, tactic: Execution, technique_id: AML.T0051, technique: LLM Prompt Injection,
+         sub_technique_id: AML.T0051.001, sub_technique: Indirect}
+      - {taxonomy: mitre-atlas, tactic: Persistence, technique_id: AML.T0099, technique: AI Agent Tool Data Poisoning}
+      - {taxonomy: mitre-atlas, tactic: Persistence, technique_id: AML.T0080, technique: AI Agent Context Poisoning}
+    frameworks:
+      owasp_llm: [LLM01:2025 Prompt Injection]
+      owasp_agentic: [ASI01 Agent Goal Hijack]
+      dasf: [13.16 Prompt Injection, 13.24 Context Spoofing and Manipulation, 9.1 Prompt inject]
+    objective: |
+      Detects injected instructions that reached the model through retrieved content (SQL results,
+      files, tool responses, model outputs), not from the user. Prompt Guard and the ai_classify
+      judge score tool results; signatures catch "SYSTEM OVERRIDE"-style planted text, and
+      `injection_recognised` catches answers where Genie itself says it ignored embedded
+      instructions. The requester is usually the victim, and whoever wrote the planted data is the
+      attacker, so the source table matters more than the user.
+    triage:
+      - "Run `investigate` and find the tool call whose result carried the payload. Note the table, file or URL it read."
+      - "Check for a follow-on action in the same session (genie_injection_then_action)."
+      - "Find who last wrote the source object (`DESCRIBE HISTORY` on the table, or audit logs)."
+    false_positives:
+      - "Tables that legitimately store prompts, jailbreak corpora or security test data."
+      - "`injection_recognised` is the model resisting the attack. It confirms an attempt, not a compromise."
+    response:
+      - "Quarantine or clean the poisoned rows and restrict MODIFY on the source."
+      - "Search other sessions that read the same object (genie_tool_calls) for the same payload."
+
+  - name: genie_system_prompt_extraction
+    description: A prompt asked Genie to reveal its system prompt or hidden instructions.
+    summary: "System prompt extraction attempt in {product} session {conversation_id} ({requester})"
+    severity: Low
+    fidelity: FIDELITY_INVESTIGATIVE
+    category: Fuzzy Signature
+    match:
+      - detector: guardrail_signal
+        labels: [system_prompt_disclosure_request]
+    mitre:
+      - {taxonomy: mitre-atlas, tactic: Exfiltration, technique_id: AML.T0056, technique: Extract LLM System Prompt}
+      - {taxonomy: mitre-atlas, tactic: Discovery, technique_id: AML.T0069, technique: Discover LLM System Information,
+         sub_technique_id: AML.T0069.002, sub_technique: System Prompt}
+    frameworks:
+      owasp_llm: [LLM07:2025 System Prompt Leakage]
+      dasf: [9.1 Prompt inject]
+    objective: |
+      Detects requests to show, dump or repeat the assistant's system prompt or internal rules.
+      This is reconnaissance before a tailored jailbreak. It is low severity on its own, but useful
+      context next to other injection signals from the same requester.
+    triage:
+      - "Check whether the response disclosed instructions (`investigate`)."
+      - "Look for injection or jailbreak signals from the same requester in the following hours."
+    false_positives:
+      - "Curious users and admins checking Genie's instructions or space configuration."
+    response:
+      - "Make sure no secrets or internal-only context live in Genie space instructions."
+
+  - name: genie_jailbreak_attempt
+    description: Boundary-pushing prompts, refusals, user-rejected tool calls or errors after an attack, i.e. attempts the guardrails stopped.
+    summary: "Jailbreak / boundary-pushing activity in {product} session {conversation_id} ({requester})"
+    severity: Low
+    fidelity: FIDELITY_INVESTIGATIVE
+    category: Behavioral
+    match:
+      - detector: guardrail_signal
+        labels: [boundary_pushing_prompt, refusal_text, refusal_outcome, tool_user_rejected, error_after_attack]
+    mitre:
+      - {taxonomy: mitre-atlas, tactic: Privilege Escalation, technique_id: AML.T0054, technique: LLM Jailbreak}
+      - {taxonomy: mitre-atlas, tactic: Defense Evasion, technique_id: AML.T0054, technique: LLM Jailbreak}
+    frameworks:
+      owasp_llm: [LLM01:2025 Prompt Injection]
+      owasp_agentic: [ASI01 Agent Goal Hijack]
+      dasf: [9.1 Prompt inject]
+    objective: |
+      Surfaces sessions where the user pushed against Genie's boundaries (asking to drop, exfiltrate
+      or bypass) and the assistant refused, the user rejected a proposed tool call, or the turn
+      failed right after an attack. These are attempts the controls handled, useful for spotting a
+      user who is probing and for tuning. Repeated signals from one requester matter more than one.
+    triage:
+      - "Group by `requester` over several days. Repeated probing is the signal."
+      - "Check `labels`. `boundary_pushing_prompt` with no refusal means the request may have been honoured."
+    false_positives:
+      - "Ordinary out-of-scope questions that Genie declines."
+      - "Users exploring what Genie can do."
+    response:
+      - "No action for a single event. For a repeated pattern, contact the requester or their manager."
+
+  # ---------------------------------------------------------------------------------------------
+  # Exfiltration
+  # ---------------------------------------------------------------------------------------------
+  - name: genie_markdown_image_exfil
+    description: A Markdown image pointing at an outside host with a query string, in data, tool output or Genie's answer.
+    summary: "Markdown image exfiltration in {product} session {conversation_id} ({requester})"
+    severity: High
+    fidelity: FIDELITY_MEDIUM
+    category: Static Signature
+    match:
+      - detector: guardrail_signal
+        labels: [markdown_image_exfil_response, markdown_image_exfil, markdown_external_query]
+    mitre:
+      - {taxonomy: mitre-atlas, tactic: Exfiltration, technique_id: AML.T0077, technique: LLM Response Rendering}
+      - {taxonomy: mitre-atlas, tactic: Exfiltration, technique_id: AML.T0057, technique: LLM Data Leakage}
+      - {taxonomy: mitre-attack, tactic: Exfiltration, technique_id: T1567, technique: Exfiltration Over Web Service}
+    frameworks:
+      owasp_llm: [LLM05:2025 Improper Output Handling, LLM02:2025 Sensitive Information Disclosure]
+      owasp_agentic: [ASI01 Agent Goal Hijack]
+      dasf: [13.23 Data Exfiltration, 10.2 Output manipulation]
+    objective: |
+      Detects the zero-click exfiltration pattern: a Markdown image whose URL is a non-Databricks host
+      with a query string. When the client renders the answer, the browser fetches the URL and
+      sends whatever the model put in the query to that host. It is usually planted in table data
+      as an indirect injection. `markdown_image_exfil_response` (the image reached Genie's answer) is
+      the most serious form.
+    triage:
+      - "If `labels` includes `markdown_image_exfil_response`, assume the URL was fetched when the answer was viewed."
+      - "Run `investigate` to find which tool result carried the image, and the source table."
+      - "Check egress or proxy logs for the destination host (it is not stored in the detection)."
+    false_positives:
+      - "Legitimate image links with tracking parameters in documentation tables."
+    response:
+      - "Remove the planted rows. Block the destination host at the egress proxy."
+      - "Treat data visible in that session as potentially disclosed."
+
+  - name: genie_external_data_send
+    description: A tool call sent data to an outside HTTP destination (requests/httpx, curl upload, SQL http_request, external URL).
+    summary: "External data send in {product} session {conversation_id} ({requester})"
+    severity: Medium
+    fidelity: FIDELITY_INVESTIGATIVE
+    category: Static Signature
+    match:
+      - detector: guardrail_signal
+        labels: [external_http_write, external_sql_http_write, external_shell_upload, external_destination]
+    mitre:
+      - {taxonomy: mitre-attack, tactic: Exfiltration, technique_id: T1567, technique: Exfiltration Over Web Service}
+      - {taxonomy: mitre-attack, tactic: Exfiltration, technique_id: T1048, technique: Exfiltration Over Alternative Protocol}
+      - {taxonomy: mitre-atlas, tactic: Exfiltration, technique_id: AML.T0086, technique: Exfiltration via AI Agent Tool Invocation}
+    frameworks:
+      owasp_llm: [LLM06:2025 Excessive Agency]
+      owasp_agentic: [ASI02 Tool Misuse and Exploitation]
+      dasf: [13.23 Data Exfiltration, 13.2 Tool Misuse]
+    objective: |
+      Detects agent tool calls that write to a non-allowlisted network destination: requests or
+      httpx POST/PUT/PATCH, curl with an upload or data flag, SQL http_request with a write method,
+      or any URL outside the Databricks and package-index allowlist in tool arguments. On its own
+      this is often a legitimate integration. After an injection, or combined with secret access,
+      it is the exfiltration step.
+    triage:
+      - "Run `investigate` to read the destination and payload in the tool arguments (access-controlled tables)."
+      - "Check whether the call succeeded and whether a secret or PII signal exists in the same session."
+    false_positives:
+      - "Webhook integrations, Slack or Teams notifications, internal APIs on non-Databricks domains."
+    response:
+      - "Add known-good hosts to `allowed_hosts` in security_patterns.yml, or block the destination."
+      - "Use serverless egress controls (network policies) to restrict outbound destinations."
+
+  - name: genie_cloud_storage_exfil
+    description: A tool call wrote data to an external cloud storage path or created an external location.
+    summary: "Write to external cloud storage in {product} session {conversation_id} ({requester})"
+    severity: High
+    fidelity: FIDELITY_MEDIUM
+    category: Static Signature
+    match:
+      - detector: guardrail_signal
+        labels: [external_cloud_write, external_location_create]
+    mitre:
+      - {taxonomy: mitre-attack, tactic: Exfiltration, technique_id: T1537, technique: Transfer Data to Cloud Account}
+      - {taxonomy: mitre-attack, tactic: Exfiltration, technique_id: T1567, technique: Exfiltration Over Web Service,
+         sub_technique_id: T1567.002, sub_technique: Exfiltration to Cloud Storage}
+      - {taxonomy: mitre-atlas, tactic: Exfiltration, technique_id: AML.T0086, technique: Exfiltration via AI Agent Tool Invocation}
+    frameworks:
+      owasp_llm: [LLM06:2025 Excessive Agency]
+      owasp_agentic: [ASI02 Tool Misuse and Exploitation]
+      dasf: [13.23 Data Exfiltration, 13.22 Excessive Permissions and Scope Creep]
+    objective: |
+      Detects DataFrame writes or dbutils.fs cp/mv/put to s3://, abfss://, wasbs:// or gs:// paths
+      outside the allowlist, and CREATE EXTERNAL LOCATION statements. Moving governed data to a
+      bucket the attacker controls bypasses Unity Catalog lineage and access control.
+    triage:
+      - "Run `investigate` to get the target path and check whether it belongs to your organisation."
+      - "Check `system.access.audit` for external location and storage credential changes by the requester."
+    false_positives:
+      - "Approved exports to the organisation's own landing buckets."
+    response:
+      - "Revoke the storage credential or external location if unexpected. Review what was written."
+
+  # ---------------------------------------------------------------------------------------------
+  # Execution and impact
+  # ---------------------------------------------------------------------------------------------
+  - name: genie_obfuscated_execution
+    description: A tool call decodes and executes an encoded payload (base64 -d, PowerShell -enc, exec(b64decode)).
+    summary: "Obfuscated code execution in {product} session {conversation_id} ({requester})"
+    severity: High
+    fidelity: FIDELITY_MEDIUM
+    category: Static Signature
+    match:
+      - detector: guardrail_signal
+        labels: [encoded_execution]
+    mitre:
+      - {taxonomy: mitre-attack, tactic: Stealth, technique_id: T1027, technique: Obfuscated Files or Information}
+      - {taxonomy: mitre-attack, tactic: Stealth, technique_id: T1140, technique: Deobfuscate/Decode Files or Information}
+      - {taxonomy: mitre-attack, tactic: Execution, technique_id: T1059, technique: Command and Scripting Interpreter,
+         sub_technique_id: T1059.006, sub_technique: Python}
+      - {taxonomy: mitre-attack, tactic: Execution, technique_id: T1059, technique: Command and Scripting Interpreter,
+         sub_technique_id: T1059.004, sub_technique: Unix Shell}
+      - {taxonomy: mitre-attack, tactic: Execution, technique_id: T1059, technique: Command and Scripting Interpreter,
+         sub_technique_id: T1059.001, sub_technique: PowerShell}
+      - {taxonomy: mitre-atlas, tactic: Execution, technique_id: AML.T0053, technique: AI Agent Tool Invocation}
+    frameworks:
+      owasp_agentic: [ASI05 Unexpected Code Execution (RCE)]
+      dasf: [13.11 Unexpected RCE and Code Attacks]
+    objective: |
+      Detects Genie Code tool calls that decode and run a payload in one step. Legitimate code
+      rarely needs to hide what it executes. An agent doing it usually means the code came from
+      injected content rather than the user.
+    triage:
+      - "Run `investigate` and decode the payload offline. Do not run it."
+      - "Check for an indirect injection signal earlier in the session."
+    false_positives:
+      - "Deployment scripts that ship base64-encoded configuration."
+    response:
+      - "Review what the decoded code did (cluster logs, audit logs). Rotate credentials available to the compute."
+
+  - name: genie_destructive_action
+    description: Destructive SQL or file operations (DROP, TRUNCATE, DELETE without filter, rm -rf, rmtree), executed or proposed.
+    summary: "Destructive action in {product} session {conversation_id} ({requester})"
+    severity: High
+    fidelity: FIDELITY_MEDIUM
+    category: Static Signature
+    match:
+      - detector: guardrail_signal
+        labels: [destructive_sql_ddl, destructive_sql_delete_all, destructive_filesystem,
+                 destructive_action_executed, destructive_confirmation_requested]
+    mitre:
+      - {taxonomy: mitre-attack, tactic: Impact, technique_id: T1485, technique: Data Destruction}
+      - {taxonomy: mitre-attack, tactic: Stealth, technique_id: T1070, technique: Indicator Removal,
+         sub_technique_id: T1070.004, sub_technique: File Deletion}
+      - {taxonomy: mitre-atlas, tactic: Impact, technique_id: AML.T0101, technique: Data Destruction via AI Agent Tool Invocation}
+    frameworks:
+      owasp_llm: [LLM06:2025 Excessive Agency]
+      owasp_agentic: [ASI02 Tool Misuse and Exploitation]
+      dasf: [13.2 Tool Misuse]
+    objective: |
+      Detects DROP/TRUNCATE of tables, schemas or catalogs, unfiltered DELETE, recursive filesystem
+      removal in tool arguments, answers saying a drop was performed ("I dropped ..."), and answers
+      asking the user to confirm a destructive step. Agents with write access can turn a vague or
+      injected instruction into irreversible data loss.
+    triage:
+      - "Check `labels`: `destructive_action_executed` or a tool-argument signature with a SUCCESS outcome means it ran; `destructive_confirmation_requested` means it was only proposed."
+      - "Run `DESCRIBE HISTORY` on the target to confirm the operation, and whether it can be undone with `UNDROP` or time travel."
+    false_positives:
+      - "Users cleaning up their own scratch tables and dev schemas."
+    response:
+      - "Restore with UNDROP TABLE, time travel or RESTORE. Remove MODIFY/MANAGE from principals that do not need it."
+
+  - name: genie_sensitive_tool_action
+    description: Broad heuristic for sensitive tool use (destructive or permission tools, risky arguments) not caught by a precise signature.
+    summary: "Sensitive tool action in {product} session {conversation_id} ({requester})"
+    severity: Low
+    fidelity: FIDELITY_INVESTIGATIVE
+    category: Fuzzy Signature
+    match:
+      - detector: guardrail_signal
+        labels: [sensitive_arguments, destructive_tool]
+    mitre:
+      - {taxonomy: mitre-atlas, tactic: Execution, technique_id: AML.T0053, technique: AI Agent Tool Invocation}
+      - {taxonomy: mitre-atlas, tactic: Privilege Escalation, technique_id: AML.T0053, technique: AI Agent Tool Invocation}
+    frameworks:
+      owasp_llm: [LLM06:2025 Excessive Agency]
+      owasp_agentic: [ASI02 Tool Misuse and Exploitation]
+      dasf: [13.2 Tool Misuse]
+    objective: |
+      Wide-net rule over tool names (delete, drop, grant, publish, share, ...) and argument keywords
+      (DROP, DELETE FROM, GRANT, curl, socket, rm -rf, ...). It overlaps the precise destructive,
+      privilege and exfiltration rules on purpose, and exists to catch new tools and phrasing. Use
+      it for hunting and tuning rather than paging.
+    triage:
+      - "Check whether a more specific rule fired for the same session. If not, read the tool call in `investigate`."
+    false_positives:
+      - "Normal administrative work in Genie Code."
+    response:
+      - "Turn repeated true positives into a precise signature in security_patterns.yml."
+
+  - name: genie_privilege_change
+    description: A tool call granted or revoked privileges or changed object ownership.
+    summary: "Privilege change in {product} session {conversation_id} ({requester})"
+    severity: Medium
+    fidelity: FIDELITY_INVESTIGATIVE
+    category: Static Signature
+    match:
+      - detector: guardrail_signal
+        labels: [permission_change]
+    mitre:
+      - {taxonomy: mitre-attack, tactic: Persistence, technique_id: T1098, technique: Account Manipulation}
+      - {taxonomy: mitre-attack, tactic: Privilege Escalation, technique_id: T1098, technique: Account Manipulation,
+         sub_technique_id: T1098.003, sub_technique: Additional Cloud Roles}
+      - {taxonomy: mitre-attack, tactic: Defense Impairment, technique_id: T1222, technique: File and Directory Permissions Modification}
+      - {taxonomy: mitre-atlas, tactic: Privilege Escalation, technique_id: AML.T0053, technique: AI Agent Tool Invocation}
+    frameworks:
+      owasp_llm: [LLM06:2025 Excessive Agency]
+      owasp_agentic: [ASI03 Identity and Privilege Abuse]
+      dasf: [13.3 Privilege Compromise, 13.22 Excessive Permissions and Scope Creep]
+    objective: |
+      Detects GRANT / REVOKE of ALL PRIVILEGES, SELECT, MODIFY, EXECUTE, MANAGE or OWNERSHIP, and
+      ALTER ... OWNER TO, in agent tool arguments. An agent that changes permissions can widen
+      access for an attacker or hide its tracks.
+    triage:
+      - "Check the grantee in `investigate`. Grants to `account users`, external groups or new service principals matter most."
+      - "Confirm against `system.access.audit` (`unityCatalog` updatePermissions events)."
+    false_positives:
+      - "Data owners sharing their own tables via Genie Code."
+    response:
+      - "Revert unexpected grants. Consider requiring approval for GRANT in Genie Code."
+
+  - name: genie_guardrail_block
+    description: Genie's own guardrails intervened (policy block, permission denied, classifier intervention).
+    summary: "Guardrail intervention in {product} session {conversation_id} ({requester})"
+    severity: Medium
+    fidelity: FIDELITY_HIGH
+    category: Behavioral
+    match:
+      - detector: guardrail_signal
+        labels: [guardrail_intervention, guardrail_intervention_tool, tool_policy_blocked, tool_permission_denied]
+    mitre:
+      - {taxonomy: mitre-atlas, tactic: Execution, technique_id: AML.T0053, technique: AI Agent Tool Invocation}
+      - {taxonomy: mitre-atlas, tactic: Privilege Escalation, technique_id: AML.T0054, technique: LLM Jailbreak}
+    frameworks:
+      owasp_llm: [LLM06:2025 Excessive Agency]
+      owasp_agentic: [ASI02 Tool Misuse and Exploitation]
+      dasf: [13.2 Tool Misuse]
+    objective: |
+      Records the verdicts Genie exports itself: the Genie Code tool outcome POLICY_BLOCKED, tool
+      calls that failed with PERMISSION_DENIED, and classifier wording such as "Action denied:" or
+      "Review suggested:" in the answer or tool output. The control worked, but something asked
+      the agent to do what policy forbids. That makes it the highest-fidelity evidence of an attempt.
+    triage:
+      - "Run `investigate` to see what was blocked and what prompt led to it."
+      - "Check whether the agent then tried a different route to the same action."
+    false_positives:
+      - "Users without access to a table hitting PERMISSION_DENIED in normal use."
+    response:
+      - "Usually none. Repeated blocks from one requester warrant a conversation."
+
+  - name: genie_runaway_agent
+    description: Unbounded loops, the same tool call repeated many times, or a turn running far longer than normal.
+    summary: "Runaway agent behaviour in {product} session {conversation_id} ({requester})"
+    severity: Low
+    fidelity: FIDELITY_INVESTIGATIVE
+    category: Behavioral
+    match:
+      - detector: guardrail_signal
+        labels: [unbounded_loop_code, repeated_tool_calls, long_running_turn]
+    mitre:
+      - {taxonomy: mitre-atlas, tactic: Impact, technique_id: AML.T0034, technique: Cost Harvesting,
+         sub_technique_id: AML.T0034.002, sub_technique: Agentic Resource Consumption}
+      - {taxonomy: mitre-atlas, tactic: Impact, technique_id: AML.T0029, technique: Denial of AI Service}
+      - {taxonomy: mitre-attack, tactic: Impact, technique_id: T1496, technique: Resource Hijacking}
+    frameworks:
+      owasp_llm: [LLM10:2025 Unbounded Consumption]
+      dasf: [13.4 Resource Overload, 9.4 Looped input]
+    objective: |
+      Heuristics for agents that do not stop: `while True` code, the same tool and code repeated at
+      least `runaway.repeat_calls` times in a turn, and turns longer than
+      `runaway.long_turn_minutes`. It is usually a stuck agent rather than an attack, but it costs
+      compute and can be induced on purpose.
+    triage:
+      - "Check the session's tool calls in `investigate` for polling loops versus retries of a failing call."
+    false_positives:
+      - "Legitimate polling of a long-running job, and long ETL steps run through Genie Code."
+    response:
+      - "Cancel any still-running compute. Raise the thresholds in security_patterns.yml if the pattern is benign."
+
+  - name: genie_discovery_enumeration
+    description: Metadata or secret-scope enumeration by an agent (information_schema, system.access, SHOW GRANTS, listScopes).
+    summary: "Discovery / enumeration in {product} session {conversation_id} ({requester})"
+    severity: Informational
+    fidelity: FIDELITY_INVESTIGATIVE
+    category: Static Signature
+    match:
+      - detector: guardrail_signal
+        labels: [metadata_enumeration, secret_scope_enumeration]
+        include_unflagged: true
+    mitre:
+      - {taxonomy: mitre-attack, tactic: Discovery, technique_id: T1087, technique: Account Discovery,
+         sub_technique_id: T1087.004, sub_technique: Cloud Account}
+      - {taxonomy: mitre-attack, tactic: Discovery, technique_id: T1069, technique: Permission Groups Discovery,
+         sub_technique_id: T1069.003, sub_technique: Cloud Groups}
+      - {taxonomy: mitre-attack, tactic: Discovery, technique_id: T1580, technique: Cloud Infrastructure Discovery}
+      - {taxonomy: mitre-attack, tactic: Discovery, technique_id: T1619, technique: Cloud Storage Object Discovery}
+      - {taxonomy: mitre-atlas, tactic: Discovery, technique_id: AML.T0075, technique: Cloud Service Discovery}
+    frameworks:
+      owasp_agentic: [ASI02 Tool Misuse and Exploitation]
+      dasf: [13.2 Tool Misuse]
+    objective: |
+      Informational context for correlation: agent queries over information_schema or
+      system.access tables, SHOW GRANTS/CATALOGS/SCHEMAS/TABLES, and secret-scope listing. These
+      findings are unflagged in genie_detections (no session risk) because they are routine for a
+      data assistant. In Lakewatch they help explain the reconnaissance before a higher-severity
+      signal.
+    triage:
+      - "Only look at these alongside another signal for the same requester or session."
+    false_positives:
+      - "Nearly all occurrences. Data discovery is what Genie is for."
+    response:
+      - "None on its own."
+
+  # ---------------------------------------------------------------------------------------------
+  # Sensitive data (PII)
+  # ---------------------------------------------------------------------------------------------
+  - name: genie_sensitive_pii
+    description: High-sensitivity PII (card, SSN, bank or IBAN, passport, licence, NHS number, crypto wallet) in Genie text.
+    summary: "Sensitive PII in {product} session {conversation_id} ({requester})"
+    severity: High
+    fidelity: FIDELITY_MEDIUM
+    category: Fuzzy Signature
+    match:
+      - detector: pii_presidio
+        labels: &sensitive_pii [CREDIT_CARD, US_SSN, US_BANK_NUMBER, IBAN_CODE, US_ITIN, CRYPTO,
+                                US_PASSPORT, US_DRIVER_LICENSE, UK_NHS]
+      - detector: pii_ai_extract
+        labels: *sensitive_pii
+    mitre:
+      - {taxonomy: mitre-atlas, tactic: Exfiltration, technique_id: AML.T0057, technique: LLM Data Leakage}
+    frameworks:
+      owasp_llm: [LLM02:2025 Sensitive Information Disclosure]
+      dasf: [9.10 Accidental exposure of unauthorized data to models, 10.6 Sensitive data output from a model]
+    objective: |
+      Promotes Presidio (and opt-in ai_extract) findings whose most severe entity has weight 0.9 or
+      more in 02_detect_pii: financial identifiers, national IDs and travel or health identifiers.
+      These values were sent to the model provider and are now in the trace and derived tables. In a
+      tool result they show the agent can read regulated data; in a prompt the user disclosed it.
+    triage:
+      - "Check `fields` to tell whether the user disclosed the value or the agent retrieved it from data."
+      - "The detection holds only offsets and types. View the text through the access-controlled tables."
+    false_positives:
+      - "Synthetic or test card numbers that pass the Luhn check."
+      - "Numeric identifiers that happen to match a national ID format."
+    response:
+      - "Follow your data-incident process if regulated data reached the model unexpectedly."
+      - "Mask or tag the source column (class.* tags plus an ABAC mask) so Genie cannot return it."
+
+  - name: genie_personal_data
+    description: Other personal data (email, phone, date of birth, ...) above the low-weight threshold.
+    summary: "Personal data in {product} session {conversation_id} ({requester})"
+    severity: Low
+    fidelity: FIDELITY_INVESTIGATIVE
+    category: Fuzzy Signature
+    match:
+      - detector: pii_presidio
+        exclude_labels: *sensitive_pii
+        min_score: 0.3
+      - detector: pii_ai_extract
+        exclude_labels: *sensitive_pii
+        min_score: 0.3
+    mitre:
+      - {taxonomy: mitre-atlas, tactic: Exfiltration, technique_id: AML.T0057, technique: LLM Data Leakage}
+    frameworks:
+      owasp_llm: [LLM02:2025 Sensitive Information Disclosure]
+      dasf: [9.10 Accidental exposure of unauthorized data to models]
+    objective: |
+      Promotes lower-weight PII findings with a weighted score of at least 0.3 (confidence x entity
+      weight in 02_detect_pii). In practice that means emails, phone numbers and dates of birth.
+      Names, locations and IP addresses alone fall below it; names with identifying detail are
+      covered by genie_pii_combination.
+    triage:
+      - "Look for volume. One email in a prompt is routine, while many in tool results point to a table that should be masked."
+    false_positives:
+      - "Business contact data the requester is entitled to see."
+    response:
+      - "Tag and mask the source column if the data should not reach the model."
+
+  - name: genie_pii_combination
+    description: A person's name together with a date of birth, phone number or location in the same session.
+    summary: "Identifiable person (name plus DOB/phone/location) in {product} session {conversation_id} ({requester})"
+    severity: Medium
+    fidelity: FIDELITY_INVESTIGATIVE
+    category: Behavioral
+    kind: custom
+    lookback_days: 7
+    query: |
+      WITH pii AS (
+        SELECT
+          coalesce(d.conversation_id, d.span.trace_id)             AS conversation_id,
+          d.requester, d.product, d.workspace_id, d.span_time, d.detected_at, d.detector, d.score,
+          d.span.trace_id                                          AS trace_id,
+          d.span.field                                             AS source_field,
+          transform(from_json(get_json_object(d.details, '$.entities'), 'ARRAY<STRUCT<type: STRING>>'),
+                    e -> e.type)                                   AS entity_types
+        FROM {detections} d
+        WHERE d.flagged AND d.detector LIKE 'pii_%'
+          AND d.span_time >= TIMERANGE_NOW() - INTERVAL {lookback_days} DAYS
+      ),
+      new_conversations AS (
+        SELECT DISTINCT conversation_id FROM pii WHERE IN_TIMERANGE(detected_at)
+      ),
+      per_conversation AS (
+        SELECT
+          p.conversation_id,
+          max(p.requester)                                         AS requester,
+          max(p.product)                                           AS product,
+          max(p.workspace_id)                                      AS workspace_id,
+          min(p.span_time)                                         AS event_time,
+          count(*)                                                 AS hit_count,
+          count(DISTINCT p.trace_id)                               AS turn_count,
+          round(max(p.score), 3)                                   AS max_score,
+          array_sort(array_distinct(flatten(collect_list(coalesce(p.entity_types, array()))))) AS entity_types,
+          array_join(array_sort(collect_set(p.detector)), ', ')    AS detectors,
+          array_join(array_sort(collect_set(p.source_field)), ', ') AS fields,
+          array_join(slice(array_sort(collect_set(p.trace_id)), 1, 10), ', ') AS trace_ids
+        FROM pii p JOIN new_conversations n ON n.conversation_id = p.conversation_id
+        GROUP BY p.conversation_id
+      )
+      SELECT
+        conversation_id, requester, product, workspace_id, event_time, hit_count, turn_count, max_score,
+        array_join(entity_types, ', ')                             AS labels,
+        detectors, fields, ''                                      AS tools, trace_ids,
+        {investigate}                                              AS investigate
+      FROM per_conversation
+      WHERE array_contains(entity_types, 'PERSON')
+        AND arrays_overlap(entity_types, array('DATE_OF_BIRTH', 'PHONE_NUMBER', 'LOCATION'))
+    mitre:
+      - {taxonomy: mitre-atlas, tactic: Exfiltration, technique_id: AML.T0057, technique: LLM Data Leakage}
+    frameworks:
+      owasp_llm: [LLM02:2025 Sensitive Information Disclosure]
+      dasf: [9.10 Accidental exposure of unauthorized data to models]
+    objective: |
+      Mirrors the session pii_combination_bonus: a name alone is weak, but a name with a date of
+      birth, phone number or location in the same conversation identifies a person. It looks back
+      `lookback_days` so the two halves can arrive in different runs, and only fires when a new PII
+      finding arrived in this run's window.
+    triage:
+      - "Check whether the entities came from the same turn and field (`trace_ids`, `fields`). Same-row data means a table holds identifiable records."
+    false_positives:
+      - "Public figures with locations, and CRM data the requester is entitled to."
+    response:
+      - "Tag and mask the source columns. Check that the space or agent only exposes the data it needs."
+
+  # ---------------------------------------------------------------------------------------------
+  # Correlation and composite risk
+  # ---------------------------------------------------------------------------------------------
+  - name: genie_injection_then_action
+    description: A prompt-injection finding followed, in the same conversation, by exfiltration, secret access, privilege change, obfuscated execution or destructive action.
+    summary: "Injection followed by agent action in {product} session {conversation_id} ({requester})"
+    severity: Critical
+    fidelity: FIDELITY_HIGH
+    category: Behavioral
+    kind: sequence
+    lookback_days: 7
+    first:
+      - detector: prompt_injection_prompt_guard
+      - detector: prompt_injection_ai_classify
+      - detector: guardrail_signal
+        labels: [instruction_override, indirect_instruction_override, role_override_marker,
+                 boundary_pushing_prompt, secret_redaction_bypass]
+    then:
+      - detector: guardrail_signal
+        labels: [external_http_write, external_sql_http_write, external_shell_upload, external_destination,
+                 external_cloud_write, external_location_create,
+                 markdown_image_exfil_response, markdown_external_query,
+                 secret_lookup_sql, secret_lookup_dbutils, credential_file_read, credential_environment_read,
+                 credential_token_api, secret_encoding_operation,
+                 permission_change, encoded_execution,
+                 destructive_sql_ddl, destructive_sql_delete_all, destructive_filesystem, destructive_action_executed]
+    mitre:
+      - {taxonomy: mitre-atlas, tactic: Execution, technique_id: AML.T0051, technique: LLM Prompt Injection}
+      - {taxonomy: mitre-atlas, tactic: Execution, technique_id: AML.T0053, technique: AI Agent Tool Invocation}
+      - {taxonomy: mitre-atlas, tactic: Exfiltration, technique_id: AML.T0086, technique: Exfiltration via AI Agent Tool Invocation}
+      - {taxonomy: mitre-atlas, tactic: Credential Access, technique_id: AML.T0098, technique: AI Agent Tool Credential Harvesting}
+      - {taxonomy: mitre-atlas, tactic: Impact, technique_id: AML.T0101, technique: Data Destruction via AI Agent Tool Invocation}
+    frameworks:
+      owasp_llm: [LLM01:2025 Prompt Injection, LLM06:2025 Excessive Agency]
+      owasp_agentic: [ASI01 Agent Goal Hijack, ASI02 Tool Misuse and Exploitation]
+      dasf: [13.6 Intent Breaking & Goal Manipulation, 13.17 Confused Deputy, 13.23 Data Exfiltration]
+    objective: |
+      Correlates the cause and the effect: an injection or jailbreak finding (Prompt Guard,
+      ai_classify, override signatures) followed in the same conversation by a high-impact tool
+      action at the same time or later. Either half can be new in this run, and the pair is searched
+      over `lookback_days`. This is the pattern that shows an injection actually steered the agent,
+      so it is the one to page on.
+    triage:
+      - "Run `investigate` and confirm the order. Did the action follow from the injected instruction or from the user's own request?"
+      - "Identify the injection source (prompt or tool result) and the action's target (host, secret, table)."
+    false_positives:
+      - "Red-team exercises."
+      - "A user who types an override phrase and then legitimately asks for an export."
+    response:
+      - "Treat as an incident. Contain the action (rotate secrets, block hosts, restore data) and clean the injection source."
+      - "Review the agent's permissions. It should not be able to perform the action without approval."
+
+  - name: genie_high_risk_session
+    description: A Genie session reached high composite risk (risk_score >= 0.8) with a new finding in this window.
+    summary: "High-risk {product} session {conversation_id} ({requester}), risk {max_score}"
+    severity: High
+    fidelity: FIDELITY_MEDIUM
+    category: Statistical
+    kind: custom
+    query: |
+      SELECT
+        s.conversation_id,
+        s.requester,
+        s.product,
+        s.workspace_id,
+        s.session_start                                            AS event_time,
+        s.flags.flag_count                                         AS hit_count,
+        s.flags.flagged_turn_count                                 AS turn_count,
+        round(s.risk_score, 3)                                     AS max_score,
+        array_join(s.flags.flag_labels, ', ')                      AS labels,
+        array_join(s.flags.flag_detectors, ', ')                   AS detectors,
+        ''                                                         AS fields,
+        array_join(s.activity.tools_used, ', ')                    AS tools,
+        array_join(slice(s.context.trace_ids, 1, 10), ', ')        AS trace_ids,
+        {investigate}                                              AS investigate
+      FROM {sessions} s
+      WHERE s.severity = 'high'
+        AND IN_TIMERANGE(s.flags.last_flagged_at)
+    mitre: []
+    frameworks:
+      owasp_llm: [LLM01:2025 Prompt Injection, LLM02:2025 Sensitive Information Disclosure, LLM06:2025 Excessive Agency]
+      dasf: [10.1 Lack of audit and monitoring inference quality]
+    objective: |
+      Carries over the composite session score from genie_sessions: risk_score = min(1, PII +
+      0.8 x injection + guardrail severity + bonuses), with high at 0.8 or more. It replaces the
+      former "sessions to review" SQL alert, so a combination of individually low findings that
+      adds up to high risk still opens an alert. The per-technique rules carry the MITRE mappings.
+    triage:
+      - "Open the per-rule signals for the same `conversation_id` first, then the timeline via `investigate`."
+    false_positives:
+      - "Red-team sessions, which combine many attack types by design."
+    response:
+      - "Follow the response for the most severe contributing rule."
