@@ -98,7 +98,7 @@ def q(sql: str):
 # MAGIC | `session_date`, `session_start`, `session_end`, `session_minutes` | flat | When. Clustered on `session_date`. |
 # MAGIC | `workspace_id`, `requester`, `principal_id` | flat | Who and where. |
 # MAGIC | `conversation_id`, `product` | flat | The key and the product (`Genie One` / `Genie Code`). |
-# MAGIC | `is_flagged`, `risk_score`, `severity` | flat | The columns the alert and dashboards filter on. `risk_score` ∈ [0, 1]; `severity` = high (≥ 0.8), medium (≥ 0.5), low, or none when not flagged. |
+# MAGIC | `is_flagged`, `risk_score`, `severity` | flat | The columns dashboards and the `genie_high_risk_session` Lakewatch rule filter on. `risk_score` ∈ [0, 1]; `severity` = high (≥ 0.8), medium (≥ 0.5), low, or none when not flagged. |
 # MAGIC | 📊 `activity` | struct | `turn_count`, `error_turn_count`, `refusal_turn_count`, `scheduled_turn_count`, `total_turn_duration_ms`, `tool_call_count`, `failed_tool_call_count`, `rejected_tool_call_count`, `approval_request_count`, `user_question_count`, `model_call_count`, `tools_used` |
 # MAGIC | 🚩 `flags` | struct | `has_pii`, `has_prompt_injection`, `has_guardrail_signal`, `flag_count`, `flagged_turn_count`, `flag_detectors`, `flag_labels`, `pii_entity_types`, `first_flagged_at`, `last_flagged_at` |
 # MAGIC | 🎚️ `risk` | struct | `max_pii_score` (already weighted by entity type), `max_prompt_injection_score`, `max_guardrail_score`, `rejected_tool_call_bonus`, `pii_combination_bonus` (a name with a DOB, phone or location). `risk_score` = min(1, PII + 0.8·injection + guardrail + bonuses). Weights live in `genie_sessions.sql`. |
@@ -110,7 +110,7 @@ def q(sql: str):
 # MAGIC   no conversation id (rare) fall back to their `trace_id`.
 # MAGIC * `flags.has_guardrail_signal` is *inferred* from outcomes and response text, because classifier
 # MAGIC   verdicts are not exported in the trace. Treat it as "worth a look", not proof.
-# MAGIC * The "sessions to review" alert reads this table (`severity`, `risk_score`, `flags.last_flagged_at`), so this is the table to watch.
+# MAGIC * The `genie_high_risk_session` Lakewatch rule reads this table (`severity`, `risk_score`, `flags.last_flagged_at`); the other Lakewatch rules read `genie_detections`.
 # MAGIC * `SELECT activity.*` expands a struct back into columns when you want the wide shape.
 
 # COMMAND ----------
@@ -520,7 +520,8 @@ LIMIT 100
 # MAGIC
 # MAGIC | Need | Go to |
 # MAGIC |---|---|
-# MAGIC | Be told when something is flagged | The "sessions to review" alert in `resources/genie_tracing_alerts.alert.yml`, evaluated at the end of every job run |
+# MAGIC | Be told when something is flagged | Lakewatch signals and alerts from the rules in `src/lakewatch/rule_catalog.yml` (MITRE ATT&CK / ATLAS mapped), deployed by `07_deploy_lakewatch_rules` |
+# MAGIC | Tune what becomes a signal, and its severity | `src/lakewatch/rule_catalog.yml`, then re-run the `deploy_lakewatch_rules` task of `genie_tracing_setup` |
 # MAGIC | Tune what counts as PII, and how bad it is | `02_detect_pii`: `pii_threshold`, `ignore_entities`, `pii_weights`; allowlist in `src/config/pii_allowlist*.yml` |
 # MAGIC | Tune prompt-injection sensitivity | `03_detect_prompt_injection`: `prompt_guard_threshold`, `run_ai_classify` |
 # MAGIC | Add guardrail wording you have seen | `04_detect_guardrail_signals`: `INTERVENTION_PATTERNS`, `REFUSAL_PATTERNS` |
