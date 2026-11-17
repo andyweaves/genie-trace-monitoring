@@ -27,7 +27,7 @@ dbutils.widgets.text("libs_volume", "genie_tracing_libs", "Libraries volume")
 dbutils.widgets.text("source_table", "unity_gateway.unified_tracing.unity_gateway_otel_spans", "Unified trace table")
 dbutils.widgets.text("spacy_model", "en_core_web_md", "spaCy model")
 dbutils.widgets.text("spacy_version", "3.8.0", "spaCy model version")
-dbutils.widgets.text("genie_one_services", "Genie One,data-rooms", "Genie One service_name values (comma-separated)")
+dbutils.widgets.text("genie_one_services", "Genie One,GenieOne,data-rooms", "Genie One service_name values (comma-separated)")
 dbutils.widgets.text("genie_code_service", "genie-code-agent", "Genie Code service_name")
 
 CATALOG = dbutils.widgets.get("catalog")

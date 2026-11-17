@@ -246,7 +246,7 @@ Variables you will most likely override (in `databricks.local.yml` or with `--va
 | `alert_email` | deployer | Who gets the Lakewatch signal email digest |
 | `lakewatch_email_min_severity` | `High` | Lowest severity in the digest (`Informational` … `Critical`; anything else sends nothing) |
 | `lakewatch_email_pause_status` | `schedule_pause_status` | `PAUSED` / `UNPAUSED` for the digest's hourly schedule |
-| `genie_one_services` | `Genie One,data-rooms` | Comma-separated `service_name` values for Genie One spans (see [What the trace contains](#what-the-trace-does-and-does-not-contain)) |
+| `genie_one_services` | `Genie One,GenieOne,data-rooms` | Comma-separated `service_name` values for Genie One spans (see [What the trace contains](#what-the-trace-does-and-does-not-contain)) |
 | `pii_allowlist_files` | `src/config/pii_allowlist.yml` | Comma-separated workspace paths of PII allowlist YAML files, merged (see [Tuning](#tuning)) |
 | `security_patterns_file` | `src/config/security_patterns.yml` | Workspace path of deterministic security signatures, scan limits, and optional runaway thresholds |
 | `prompt_guard_model_source` | `huggingface` | How `genie_tracing_setup` gets the Prompt Guard weights: `huggingface` (secret `hf_secret_scope` / `hf_secret_key`, default `genie_tracing` / `hf_token`) or `uc_model` (`prompt_guard_source_uc_model`) |
@@ -634,7 +634,8 @@ Verified against live traces in November 2026. These shape what the detectors ca
   off that text. It will get sharper the day verdicts arrive as span events.
 * The unified trace table is shared with AI Gateway model traffic; everything here filters on
   `service_name`: `genie-code-agent` for Genie Code, and the `genie_one_services` list for Genie One.
-  Genie One shows up under more than one value: `Genie One` for the web and desktop app, and
+  Genie One shows up under more than one value: `Genie One` for the web and desktop app, `GenieOne`
+  for conversations from the `databricks genie ask` CLI (seen November 2026), and
   `data-rooms` for conversations started through the API or CLI (`databricks.genie.channel =
   databricks_cli`), with the same span shape. Check `00_setup` section 1 for the values in your
   table and extend the list if a new one appears; spans under an unlisted name are silently skipped.

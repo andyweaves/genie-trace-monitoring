@@ -28,7 +28,7 @@ variables:
   # than one: `Genie One` for the web / desktop app, `data-rooms` for API and CLI conversations.
   genie_one_services:
     description: Comma-separated service_name values for Genie One spans.
-    default: Genie One,data-rooms
+    default: Genie One,GenieOne,data-rooms
   genie_code_service:
     default: genie-code-agent
 
