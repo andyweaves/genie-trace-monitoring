@@ -1,0 +1,16 @@
+# AI/BI dashboard for investigating one Genie session: risk, step-by-step timeline with text, and
+# the findings behind each flag. Every Lakewatch signal links to it pre-filtered to its conversation
+# (`dashboard_url`), via the filter on page `investigate`, widget `conversation`. Keep those two
+# names stable in the JSON: renaming them breaks the deep links in signals already raised.
+#
+# The dashboard shows full prompt and response text. Viewers need SELECT on the genie_tracing
+# tables (embed_credentials: false, so each viewer queries with their own permissions).
+resources:
+  dashboards:
+    genie_session_investigation:
+      display_name: "[${bundle.target}] Genie session investigation"
+      file_path: ../src/dashboards/genie_session_investigation.lvdash.json
+      warehouse_id: ${var.warehouse_id}
+      dataset_catalog: ${var.catalog}
+      dataset_schema: ${resources.schemas.genie_tracing.name}
+      embed_credentials: false

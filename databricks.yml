@@ -107,6 +107,11 @@ variables:
   lakewatch_rule_catalog_file:
     description: Workspace path of the Lakewatch rule catalog YAML.
     default: ${workspace.file_path}/src/lakewatch/rule_catalog.yml
+  workspace_url:
+    description: >
+      Base URL used in the investigation links each Lakewatch signal carries (dashboard and
+      Catalog Explorer). Blank = the workspace the rules are deployed from.
+    default: ""
 
   # Email digest of new Lakewatch signals (resources/genie_tracing_lakewatch_email.alert.yml).
   # Lakewatch itself exports alerts to webhook / Jira / ServiceNow / Tines / Slack, not email.

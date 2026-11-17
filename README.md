@@ -8,7 +8,7 @@ MITRE ATT&CK and ATLAS, so they arrive as signals and alerts in your SIEM workfl
 
 Everything is a [Databricks Asset Bundle](https://docs.databricks.com/dev-tools/bundles/):
 two serverless Lakeflow pipelines, two jobs (one-time setup and hourly monitoring), eight notebooks
-and a catalog of 22 Lakewatch detection rules, deployable to any workspace with a single
+a session investigation dashboard and a catalog of 23 Lakewatch detection rules, deployable to any workspace with a single
 `databricks bundle deploy`.
 
 ## Contents
@@ -142,7 +142,8 @@ processing (`CREATE OR REFRESH STREAMING TABLE ... FROM STREAM(...)`).
 | Pipeline `genie_tracing_sessions` | `src/pipelines/sessions/` | `genie_sessions`, `genie_session_timeline` |
 | Job `genie_tracing_setup` | `resources/genie_tracing_setup.job.yml` | One-time: `00_setup` → `01_deploy_prompt_guard` and `07_deploy_lakewatch_rules`, parameterised from the bundle variables. Run on demand, and again after editing the rule catalog. |
 | Job `genie_tracing_monitoring` | `resources/genie_tracing_monitoring.job.yml` | ETL → 3 detection notebooks → sessions. Hourly, paused by default. |
-| Lakewatch detection rules | `src/lakewatch/rule_catalog.yml` | 22 rules over `genie_detections` / `genie_sessions`, created through the Lakewatch rules API by `07_deploy_lakewatch_rules` (there is no bundle resource for them). See [Lakewatch detection rules](#lakewatch-detection-rules). |
+| Lakewatch detection rules | `src/lakewatch/rule_catalog.yml` | 23 rules over `genie_detections` / `genie_sessions`, created through the Lakewatch rules API by `07_deploy_lakewatch_rules` (there is no bundle resource for them). See [Lakewatch detection rules](#lakewatch-detection-rules). |
+| Dashboard "Genie session investigation" | `resources/genie_tracing_investigation.dashboard.yml` | One page: session risk, step-by-step timeline with text, and the findings behind each flag, filtered by conversation. Every Lakewatch signal links to it (`dashboard_url`). |
 | SQL alert "new Lakewatch signals" | `resources/genie_tracing_lakewatch_email.alert.yml` | Hourly email digest of new signals at or above `lakewatch_email_min_severity` from these rules, read from the Lakewatch signals view (Lakewatch itself does not send email). Rule, severity, summary and identifiers only, never prompt text. |
 
 ### Notebooks (`src/notebooks/`, Python source format)
@@ -241,6 +242,7 @@ Variables you will most likely override (in `databricks.local.yml` or with `--va
 | `lakewatch_run_as` | deployer | User email or service-principal application ID the rules run as |
 | `lakewatch_schedule` | catalog (`1h`) | Override every rule's schedule (minimum `5m`) |
 | `lakewatch_rules_enabled` | `true` | Create the rules scheduled or unscheduled |
+| `workspace_url` | this workspace | Base URL for the investigation links in signals |
 | `alert_email` | deployer | Who gets the Lakewatch signal email digest |
 | `lakewatch_email_min_severity` | `High` | Lowest severity in the digest (`Informational` … `Critical`; anything else sends nothing) |
 | `lakewatch_email_pause_status` | `schedule_pause_status` | `PAUSED` / `UNPAUSED` for the digest's hourly schedule |
@@ -342,7 +344,7 @@ Weights live in `src/pipelines/sessions/transformations/genie_sessions.sql`.
 ## Lakewatch detection rules
 
 The detectors write findings; [Lakewatch](https://docs.databricks.com/aws/en/lakewatch/) decides
-who hears about them. `src/lakewatch/rule_catalog.yml` defines 22 detection rules that promote
+who hears about them. `src/lakewatch/rule_catalog.yml` defines 23 detection rules that promote
 findings from `genie_detections` (and the composite score in `genie_sessions`) into Lakewatch
 signals and alerts. Each rule has a severity, fidelity, category, MITRE ATT&CK and ATLAS mappings,
 OWASP and DASF annotations, an objective and a Markdown runbook. The notebooks stay the detection
@@ -353,17 +355,19 @@ rules decide what becomes a signal and how it is classified.
 
 * **One signal per (rule, conversation)** per run, never one per finding. Context carries
   `conversation_id`, `requester`, `product`, `workspace_id`, `labels`, `detectors`, `fields`,
-  `tools`, `hit_count`, `turn_count`, `max_score`, up to ten `trace_ids`, and `investigate`, a
-  ready-made query over `genie_session_timeline`. **No prompt, response, argument or result text**
+  `tools`, `hit_count`, `turn_count`, `max_score`, up to ten `trace_ids`, `investigate` (a
+  ready-made query over `genie_session_timeline`), and two links: `dashboard_url`, which opens the
+  investigation dashboard filtered to the conversation, and `catalog_explorer_url`. **No prompt, response, argument or result text**
   reaches a signal: the renderer rejects any rule that selects a free-text column or an evidence
   key other than `source_field`, `tool_name` or `entities`.
 * **New findings only.** Rules filter on `IN_TIMERANGE(detected_at)`. `detected_at` only moves when
   a finding appears or its score rises, so the hourly re-scan does not re-signal. `extend_lookback:
   2h` covers the monitoring job's run time, and 24-hour deduplication absorbs the overlap.
-* **Three kinds of rule.** `match` rules select findings by detector, label, source field and score.
-  `genie_injection_then_action` is a `sequence`: an injection finding followed in the same
+* **Four kinds of rule.** `match` rules select findings by detector, label, source field and score.
+  `genie_lethal_trifecta` is a `chain`, and the only Critical rule (see below).
+  `genie_injection_then_action` (High) is a `sequence`: an injection finding followed in the same
   conversation by exfiltration, secret access, privilege change, obfuscated execution or a
-  destructive action, searched over seven days. It is the one to page on. `genie_pii_combination`
+  destructive action, searched over seven days. `genie_pii_combination`
   (a name with a date of birth, phone number or location) and `genie_high_risk_session`
   (`risk_score` ≥ 0.8, the replacement for the old "sessions to review" SQL alert) are `custom` SQL.
 * **Taxonomies.** `mitre-attack` uses Enterprise ATT&CK v20 tactic names (Stealth and Defense
@@ -372,6 +376,47 @@ rules decide what becomes a signal and how it is classified.
   Destruction via AI Agent Tool Invocation*. Frameworks go in `annotations` (`owasp_llm_top10`,
   `owasp_agentic_top10`, `dasf_risks`, `mitre_techniques`) and are repeated in the objective.
   `tests/verify_mitre_mappings.py` checks every ID, name and tactic against the published MITRE data.
+
+### The lethal trifecta
+
+An agent that can read private data, is exposed to untrusted instructions, and can communicate
+externally can be steered into leaking that data. `genie_lethal_trifecta` (Critical, high
+fidelity) fires when all three show up in one Genie conversation within seven days:
+
+| Leg | Counts as |
+|---|---|
+| `injection` | Prompt Guard or `ai_classify` injection findings (prompt or tool result), `instruction_override`, `indirect_instruction_override`, `role_override_marker`, `injection_recognised` |
+| `private_data` | Flagged PII in any model input or output except `IP_ADDRESS`, credential-shaped values, and agent secret reads (`secret_lookup_*`, credential file / environment / token API reads, `secret_encoding_operation`) |
+| `external_communication` | HTTP, curl and SQL `http_request` writes, non-allowlisted URLs and cloud-storage writes in tool calls, and Markdown-image exfiltration rendered in Genie's answer (a planted image that only sits in tool output does not count) |
+
+Injection and private data may arrive in either order; the external communication must come at
+or after both. `labels` lists the findings per leg (`injection: … | private_data: … |
+external_communication: …`). `tests/test_lakewatch_rule_sql.py` runs the rendered rule over a
+synthetic fixture on a warehouse (opt-in, like `test_guardrail_sql.py`), covering both orderings and
+the cases that must not fire: exfil before the data, no injection, an IP address as the only data,
+and an unrendered image.
+
+### Investigating a signal
+
+Every signal, runbook and email row points at the same three tables, with the conversation filled in:
+
+* **`dashboard_url`** opens *Genie session investigation*
+  (`resources/genie_tracing_investigation.dashboard.yml`), an AI/BI dashboard showing the session's
+  risk, its step-by-step timeline with text, and the findings behind each flag, filtered to the
+  conversation. The link sets the dashboard's `conversation` filter on page `investigate`
+  (`…/published?o=<workspace_id>&f_investigate~conversation=<conversation_id>`). Keep those two names
+  stable in the JSON, or existing links stop filtering. The dashboard runs with each viewer's own
+  permissions (`embed_credentials: false`), so seeing the text still depends on the table grants.
+* **`catalog_explorer_url`** and the runbook's *Investigate* section link the tables in Catalog
+  Explorer, and give ready-to-run SQL for the timeline, the findings, the session's risk, and the
+  same user's other flagged sessions.
+* **Runbooks** end with *Verdict* guidance (true, benign or false positive, or leave it
+  unclassified). The Lakewatch rules API says analysts and the Lakewatch investigation agent follow
+  the runbook when triaging an alert, so this is how the agent learns where the evidence is and how
+  to classify.
+
+`07_deploy_lakewatch_rules` builds the links from the bundle's dashboard ID and the workspace it
+runs in (override with `workspace_url`). Without a dashboard ID the link columns are empty.
 
 | Rule | Severity | Fidelity | ATT&CK | ATLAS | OWASP | DASF |
 |---|---|---|---|---|---|---|
@@ -395,7 +440,8 @@ rules decide what becomes a signal and how it is classified.
 | `genie_sensitive_pii` | High | Medium | – | AML.T0057 | LLM02 | 9.10, 10.6 |
 | `genie_personal_data` | Low | Investigative | – | AML.T0057 | LLM02 | 9.10 |
 | `genie_pii_combination` | Medium | Investigative | – | AML.T0057 | LLM02 | 9.10 |
-| `genie_injection_then_action` | Critical | High | – | AML.T0051, AML.T0053, AML.T0086, AML.T0098, AML.T0101 | LLM01, LLM06, ASI01, ASI02 | 13.6, 13.17, 13.23 |
+| `genie_lethal_trifecta` | Critical | High | T1567 | AML.T0051, AML.T0057, AML.T0077, AML.T0086 | LLM01, LLM02, LLM06, ASI01, ASI02 | 13.16, 13.23, 10.6 |
+| `genie_injection_then_action` | High | High | – | AML.T0051, AML.T0053, AML.T0086, AML.T0098, AML.T0101 | LLM01, LLM06, ASI01, ASI02 | 13.6, 13.17, 13.23 |
 | `genie_high_risk_session` | High | Medium | – | – | LLM01, LLM02, LLM06 | 10.1 |
 
 `not_signalled` in the catalog lists the informational detector outputs deliberately left out
@@ -408,7 +454,8 @@ On the red-team trace set (44 RT attack cases, 30 BN benign controls), rules abo
 signalled 39 RT and 4 BN cases: a PAT-shaped value (`genie_credential_exposed`), a non-allowlisted
 URL (`genie_external_data_send`), a sensitive-argument keyword (`genie_sensitive_tool_action`), and
 one prompt that Prompt Guard and the LLM judge both scored as an injection. The
-Critical `genie_injection_then_action` fired only on RT cases. RT labels cover attack types these
+`genie_injection_then_action` (then Critical, now High) fired only on RT cases. No conversation in
+either trace set has all three trifecta legs, which is why the trifecta has its own SQL fixture test. RT labels cover attack types these
 detectors do not target, so the RT fraction is not a recall measure.
 
 ### Deploying and changing rules
@@ -451,7 +498,8 @@ For email, the bundle deploys a SQL alert, `[<target>] Genie: new Lakewatch sign
 `<lakewatch_catalog>.__lakewatch.signals` every hour (at :50) and emails `alert_email` a table of
 the signals created in the last hour at or above `lakewatch_email_min_severity` (default `High`).
 It covers this repo's rules only (`<lakewatch_catalog>.<lakewatch_schema>.genie_*`), lists the
-highest severity first, and includes each signal's `alert_id` so you can open it in Lakewatch. It
+highest severity first, and includes each signal's `alert_id` and `investigate_url` (the
+dashboard deep link), so you can open the alert in Lakewatch or the session directly. It
 follows `lakewatch_email_pause_status`, so it is paused in `dev` and runs in `prod` unless you
 override it. The alert's owner needs `SELECT` on the signals view. Because it notifies per signal
 rather than per grouped alert, a busy session can appear on several rows.
@@ -629,12 +677,14 @@ Verified against live traces in November 2026. These shape what the detectors ca
 │   ├── genie_tracing_sessions.pipeline.yml
 │   ├── genie_tracing_setup.job.yml     one-time setup: 00_setup → 01_deploy_prompt_guard, 07_deploy_lakewatch_rules
 │   ├── genie_tracing_monitoring.job.yml
-│   └── genie_tracing_lakewatch_email.alert.yml  email digest of new Lakewatch signals
+│   ├── genie_tracing_lakewatch_email.alert.yml  email digest of new Lakewatch signals
+│   └── genie_tracing_investigation.dashboard.yml session investigation dashboard
 ├── src/
 │   ├── pipelines/etl/transformations/        genie_turns.sql, genie_tool_calls.sql
 │   ├── pipelines/sessions/transformations/   genie_sessions.sql, genie_session_timeline.sql
 │   ├── config/                               PII allowlists + deterministic security signatures
 │   ├── lakewatch/rule_catalog.yml            Lakewatch detection rules: SQL, MITRE, frameworks, runbooks
+│   ├── dashboards/                           genie_session_investigation.lvdash.json
 │   ├── notebooks/                            00 … 07 + shared detection / security / Lakewatch helpers, images/
 │   └── sql/access_control.sql
 ├── tests/                                    local regressions + content-free trace scorecard

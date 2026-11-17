@@ -50,6 +50,8 @@ dbutils.widgets.dropdown("mode", "dry_run", ["dry_run", "deploy"], "Mode")
 dbutils.widgets.dropdown("prune", "false", ["false", "true"], "Delete managed rules no longer in the catalog")
 dbutils.widgets.text("preview_days", "7", "Preview each rule over the last N days (0 = skip)")
 dbutils.widgets.text("rules", "", "Only these rules (comma-separated; blank = all)")
+dbutils.widgets.text("dashboard_id", "", "Investigation dashboard ID for signal links (blank = no dashboard link)")
+dbutils.widgets.text("workspace_url", "", "Workspace URL for links (blank = this workspace)")
 
 CATALOG = dbutils.widgets.get("catalog").strip()
 SCHEMA = dbutils.widgets.get("schema").strip()
@@ -64,6 +66,8 @@ MODE = dbutils.widgets.get("mode")
 PRUNE = dbutils.widgets.get("prune") == "true"
 PREVIEW_DAYS = int(dbutils.widgets.get("preview_days") or 0)
 ONLY = {r.strip() for r in dbutils.widgets.get("rules").split(",") if r.strip()}
+DASHBOARD_ID = dbutils.widgets.get("dashboard_id").strip()
+WORKSPACE_URL = dbutils.widgets.get("workspace_url").strip()
 
 if not WAREHOUSE_ID:
     raise ValueError("warehouse_id is required: Lakewatch rules run on a SQL warehouse")
@@ -75,6 +79,7 @@ CTX = dict(
     catalog_name=LW_CATALOG, schema_name=LW_SCHEMA, warehouse_id=WAREHOUSE_ID,
     detections=f"{FQ}.genie_detections", sessions=f"{FQ}.genie_sessions",
     timeline=f"{FQ}.genie_session_timeline",
+    data_catalog=CATALOG, data_schema=SCHEMA, dashboard_id=DASHBOARD_ID,
     run_as_principal=RUN_AS, enabled=ENABLED, schedule=SCHEDULE,
 )
 print(f"mode={MODE} prune={PRUNE}; rules in {LW_CATALOG}.{LW_SCHEMA}, reading {FQ}, warehouse {WAREHOUSE_ID}")
@@ -82,10 +87,11 @@ print(f"mode={MODE} prune={PRUNE}; rules in {LW_CATALOG}.{LW_SCHEMA}, reading {F
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2. Lakewatch API client
+# MAGIC ## 2. Lakewatch API client and investigation links
 # MAGIC
 # MAGIC Thin wrapper over the workspace REST client, using the notebook's own credentials. Listing
-# MAGIC is paged and scoped to the target catalog and schema.
+# MAGIC is paged and scoped to the target catalog and schema. The workspace host and ID are read here
+# MAGIC to build the `dashboard_url` / `catalog_explorer_url` links each signal carries.
 
 # COMMAND ----------
 
@@ -93,6 +99,15 @@ from databricks.sdk import WorkspaceClient
 
 w = WorkspaceClient()
 API = "/api/2.0/lakewatch"
+
+# Links in signals and runbooks: the investigation dashboard (pre-filtered to the conversation)
+# and Catalog Explorer. The host and workspace ID default to this workspace.
+CTX["workspace_url"] = (WORKSPACE_URL or w.config.host or "").rstrip("/")
+try:
+    CTX["workspace_id"] = str(w.get_workspace_id())
+except Exception:
+    CTX["workspace_id"] = ""
+print("Dashboard link prefix:", dashboard_base_url(CTX) or "(none: dashboard_id not set)")
 
 
 def lw(method, path, query=None, body=None):

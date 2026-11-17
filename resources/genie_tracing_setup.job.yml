@@ -81,5 +81,7 @@ resources:
               run_as_principal: ${var.lakewatch_run_as}
               schedule: ${var.lakewatch_schedule}
               enabled: ${var.lakewatch_rules_enabled}
+              dashboard_id: ${resources.dashboards.genie_session_investigation.id}
+              workspace_url: ${var.workspace_url}
               mode: deploy
               preview_days: "0"
