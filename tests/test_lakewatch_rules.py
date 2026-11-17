@@ -2,6 +2,7 @@
 
 import ast
 import importlib.util
+import json
 from pathlib import Path
 import re
 import unittest
@@ -193,6 +194,69 @@ class PayloadTests(unittest.TestCase):
         p = UTILS.build_payload(RULES["genie_credential_exposed"], CATALOG, dict(CTX, run_as_principal="sp-app-id"))
         self.assertEqual(p["run_as_principal"], "sp-app-id")
         self.assertIn("run_as_principal", UTILS.update_mask(p))
+
+
+class TrifectaAndLinkTests(unittest.TestCase):
+    def test_lethal_trifecta_is_the_only_critical_rule(self):
+        critical = sorted(n for n, p in PAYLOADS.items() if p["severity"] == "Critical")
+        self.assertEqual(critical, ["genie_lethal_trifecta"])
+        self.assertEqual(PAYLOADS["genie_injection_then_action"]["severity"], "High")
+
+    def test_trifecta_legs(self):
+        legs = {leg["name"]: leg["match"] for leg in RULES["genie_lethal_trifecta"]["legs"]}
+        self.assertEqual(list(legs), ["injection", "private_data", "external_communication"])
+        pii = [e for e in legs["private_data"] if e["detector"].startswith("pii_")]
+        self.assertTrue(pii and all(e["exclude_labels"] == ["IP_ADDRESS"] for e in pii))
+        rendered = [e for e in legs["external_communication"] if "markdown_external_query" in e.get("labels", [])]
+        self.assertEqual(rendered[0]["fields"], ["response"], "a planted image only counts once rendered")
+        self.assertNotIn("boundary_pushing_prompt", [l for e in legs["injection"] for l in e.get("labels", [])])
+
+    def test_chain_validation(self):
+        import copy
+
+        for mutate, message in (
+            (lambda r: r.update(legs=r["legs"][:1]), "at least two legs"),
+            (lambda r: r["legs"][1].update(name="injection"), "unique"),
+            (lambda r: r["legs"][0].update(match=[]), "each chain leg"),
+        ):
+            catalog = copy.deepcopy(CATALOG)
+            mutate(next(r for r in catalog["rules"] if r["name"] == "genie_lethal_trifecta"))
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                UTILS.validate_catalog(catalog)
+
+    def test_links_on_every_rule(self):
+        for name, p in PAYLOADS.items():
+            query = p["batch"]["sql"]["query"]
+            self.assertIn("f_investigate~conversation=', url_encode(q.conversation_id)) AS dashboard_url", query, name)
+            self.assertIn("/explore/data/example_catalog/genie_tracing/genie_session_timeline", query, name)
+            self.assertEqual(p["output"]["context"]["dashboard_url"], "{dashboard_url}")
+
+    def test_links_blank_without_dashboard_or_host(self):
+        ctx = dict(CTX, dashboard_id="", workspace_url="")
+        query = UTILS.render_query(RULES["genie_credential_exposed"], ctx)
+        self.assertIn("'' AS dashboard_url", query)
+        self.assertIn("'' AS catalog_explorer_url", query)
+        self.assertNotIn("Catalog Explorer:", UTILS.build_payload(RULES["genie_credential_exposed"], CATALOG, ctx)["runbook"])
+
+    def test_runbooks_prime_analysts_and_the_triage_agent(self):
+        for name, p in PAYLOADS.items():
+            for section in ("## Investigate", "## Verdict", "**True positive**", "**Benign positive**",
+                            "ORDER BY step_number", "[genie_detections]("):
+                self.assertIn(section, p["runbook"], name)
+
+    def test_dashboard_filter_matches_deep_links(self):
+        dashboard = json.loads((ROOT / "src/dashboards/genie_session_investigation.lvdash.json").read_text())
+        page, widget = UTILS.DASHBOARD_FILTER[2:].split("~")
+        pages = {pg["name"]: pg for pg in dashboard["pages"]}
+        self.assertIn(page, pages)
+        filters = [l["widget"] for l in pages[page]["layout"] if l["widget"]["name"] == widget]
+        self.assertEqual(len(filters), 1)
+        bound = {q["query"]["datasetName"] for q in filters[0]["queries"]}
+        self.assertEqual(bound, {d["name"] for d in dashboard["datasets"]}, "filter must bind every dataset")
+        for d in dashboard["datasets"]:
+            sql = "".join(d["queryLines"])
+            self.assertRegex(sql, r"\bconversation_id\b")
+            self.assertNotRegex(sql, r"(?i)\bFROM\s+\S+\.\S+", "dashboard queries must use bare table names")
 
 
 class PlanTests(unittest.TestCase):

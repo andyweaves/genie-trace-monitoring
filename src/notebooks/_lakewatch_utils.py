@@ -29,7 +29,7 @@ SEVERITIES = ("Informational", "Low", "Medium", "High", "Critical")
 FIDELITIES = ("FIDELITY_DEVELOPMENT", "FIDELITY_INVESTIGATIVE", "FIDELITY_MEDIUM", "FIDELITY_HIGH")
 DEFAULT_CATEGORIES = ("Static Signature", "Fuzzy Signature", "Behavioral", "Statistical", "Learning (AI/ML)")
 DEDUPLICATION_MODES = ("DEDUPLICATION_DEFAULT", "DEDUPLICATION_ENABLED", "DEDUPLICATION_DISABLED")
-KINDS = ("match", "sequence", "custom")
+KINDS = ("match", "sequence", "chain", "custom")
 DETECTORS = (
     "pii_presidio", "pii_ai_extract", "prompt_injection_prompt_guard",
     "prompt_injection_ai_classify", "guardrail_signal",
@@ -62,7 +62,14 @@ OUTPUT_COLUMNS = (
     "conversation_id", "requester", "product", "workspace_id", "event_time", "hit_count",
     "turn_count", "max_score", "labels", "detectors", "fields", "tools", "trace_ids", "investigate",
 )
-CONTEXT_KEYS = tuple(c for c in OUTPUT_COLUMNS if c != "event_time")
+# Added to every rule's output by render_query: links an analyst (or the Lakewatch triage agent)
+# can open straight from the signal. Empty when the deployer has no dashboard / host to link to.
+LINK_COLUMNS = ("dashboard_url", "catalog_explorer_url")
+CONTEXT_KEYS = tuple(c for c in OUTPUT_COLUMNS if c != "event_time") + LINK_COLUMNS
+LEG_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
+# Filter on the investigation dashboard that deep links set: page `investigate`, widget
+# `conversation` (names pinned in src/dashboards/genie_session_investigation.lvdash.json).
+DASHBOARD_FILTER = "f_investigate~conversation"
 
 # Free-text columns of the source tables. A rule query must not select them, so no prompt,
 # response, argument or result text can reach a signal (signals sit outside the table ACLs).
@@ -115,6 +122,8 @@ def _match_entries(rule):
         return list(rule.get("match") or [])
     if kind == "sequence":
         return list(rule.get("first") or []) + list(rule.get("then") or [])
+    if kind == "chain":
+        return [entry for leg in rule.get("legs") or [] for entry in leg.get("match") or []]
     return []
 
 
@@ -216,6 +225,16 @@ def validate_catalog(catalog, categories=DEFAULT_CATEGORIES):
             problems.append(f"{where}: match rules need at least one match entry")
         if kind == "sequence" and not (rule.get("first") and rule.get("then")):
             problems.append(f"{where}: sequence rules need first and then")
+        if kind == "chain":
+            legs = rule.get("legs") or []
+            if len(legs) < 2:
+                problems.append(f"{where}: chain rules need at least two legs")
+            leg_names = [leg.get("name") for leg in legs]
+            if len(set(leg_names)) != len(leg_names):
+                problems.append(f"{where}: chain leg names must be unique")
+            for leg in legs:
+                if not LEG_NAME_RE.match(str(leg.get("name", ""))) or not leg.get("match"):
+                    problems.append(f"{where}: each chain leg needs a name matching {LEG_NAME_RE.pattern} and match entries")
         if kind == "custom" and not str(rule.get("query") or "").strip():
             problems.append(f"{where}: custom rules need a query")
         for j, entry in enumerate(_match_entries(rule)):
@@ -267,8 +286,27 @@ def example_context():
         detections="example_catalog.genie_tracing.genie_detections",
         sessions="example_catalog.genie_tracing.genie_sessions",
         timeline="example_catalog.genie_tracing.genie_session_timeline",
+        data_catalog="example_catalog", data_schema="genie_tracing",
+        workspace_url="https://example.cloud.databricks.com", workspace_id="1234567890",
+        dashboard_id="01ef0000000000000000000000000000",
         run_as_principal=None, enabled=True, schedule=None,
     )
+
+
+def dashboard_base_url(ctx):
+    """Deep-link prefix for the investigation dashboard; append a URL-encoded conversation_id."""
+    if not (ctx.get("workspace_url") and ctx.get("dashboard_id")):
+        return ""
+    query = f"?o={ctx['workspace_id']}&" if ctx.get("workspace_id") else "?"
+    return f"{ctx['workspace_url'].rstrip('/')}/dashboardsv3/{ctx['dashboard_id']}/published{query}{DASHBOARD_FILTER}="
+
+
+def explorer_url(ctx, table):
+    """Catalog Explorer link to one of the genie_tracing tables."""
+    if not (ctx.get("workspace_url") and ctx.get("data_catalog") and ctx.get("data_schema")):
+        return ""
+    query = f"?o={ctx['workspace_id']}" if ctx.get("workspace_id") else ""
+    return f"{ctx['workspace_url'].rstrip('/')}/explore/data/{ctx['data_catalog']}/{ctx['data_schema']}/{table}{query}"
 
 # COMMAND ----------
 
@@ -280,6 +318,10 @@ def example_context():
 # MAGIC   by the hourly job does not produce a new signal.
 # MAGIC * `sequence`: a `first` finding and a `then` finding at the same time or later in one
 # MAGIC   conversation, searched over `lookback_days`, where at least one of them is new in the window.
+# MAGIC * `chain`: every leg present in one conversation (searched over `lookback_days`), all legs but
+# MAGIC   the last in any order, and the last leg at or after all of them, e.g. the lethal trifecta:
+# MAGIC   untrusted instructions and private data, then external communication. Fires when any of the
+# MAGIC   evidence is new in the window.
 # MAGIC * `custom`: hand-written SQL with `{detections}`, `{sessions}`, `{timeline}`,
 # MAGIC   `{lookback_days}` and `{investigate}` placeholders.
 
@@ -407,6 +449,66 @@ FROM pairs
 GROUP BY conversation_id"""
 
 
+def _render_chain(rule, ctx):
+    days = int(rule.get("lookback_days", 7))
+    legs = rule["legs"]
+    *before, last = legs
+    time_filter = f"d.span_time >= TIMERANGE_NOW() - INTERVAL {days} DAYS"
+    leg_ctes = ",\n".join(
+        f"leg_{leg['name']} AS (SELECT *, {_sql_str(leg['name'])} AS leg FROM base WHERE {_any_of(leg['match'])})"
+        for leg in legs
+    )
+    before_union = "\n  UNION ALL ".join(f"SELECT * FROM leg_{leg['name']}" for leg in before)
+    label_parts = ",\n    ".join(
+        f"concat({_sql_str(leg['name'] + ': ')}, array_join(array_sort(collect_set("
+        f"CASE WHEN leg = {_sql_str(leg['name'])} THEN label END)), ', '))"
+        for leg in legs
+    )
+    return f"""WITH {_base_cte(ctx['detections'], time_filter)},
+{leg_ctes},
+before_legs AS (
+  {before_union}
+),
+ready AS (
+  -- When every earlier leg has been seen at least once in the conversation
+  SELECT conversation_id, max(first_time) AS ready_time
+  FROM (SELECT conversation_id, leg, min(span_time) AS first_time FROM before_legs GROUP BY conversation_id, leg)
+  GROUP BY conversation_id
+  HAVING count(DISTINCT leg) = {len(before)}
+),
+final_leg AS (
+  SELECT l.* FROM leg_{last['name']} l
+  JOIN ready r ON r.conversation_id = l.conversation_id AND l.span_time >= r.ready_time
+),
+evidence AS (
+  SELECT b.* FROM before_legs b WHERE b.conversation_id IN (SELECT conversation_id FROM final_leg)
+  UNION ALL
+  SELECT * FROM final_leg
+),
+new_conversations AS (
+  SELECT DISTINCT conversation_id FROM evidence WHERE IN_TIMERANGE(detected_at)
+)
+SELECT
+  conversation_id,
+  max(requester)                                                      AS requester,
+  max(product)                                                        AS product,
+  max(workspace_id)                                                   AS workspace_id,
+  min(span_time)                                                      AS event_time,
+  count(*)                                                            AS hit_count,
+  count(DISTINCT trace_id)                                            AS turn_count,
+  round(max(score), 3)                                                AS max_score,
+  concat_ws(' | ',
+    {label_parts})                                                    AS labels,
+  array_join(array_sort(collect_set(detector)), ', ')                 AS detectors,
+  array_join(array_sort(collect_set(source_field)), ', ')             AS fields,
+  array_join(array_sort(collect_set(tool_name)), ', ')                AS tools,
+  array_join(slice(array_sort(collect_set(trace_id)), 1, 10), ', ')   AS trace_ids,
+  {_investigate(ctx['timeline'])} AS investigate
+FROM evidence
+WHERE conversation_id IN (SELECT conversation_id FROM new_conversations)
+GROUP BY conversation_id"""
+
+
 def _render_custom(rule, ctx):
     query = rule["query"].strip()
     for key, value in (
@@ -421,11 +523,24 @@ def _render_custom(rule, ctx):
     return query
 
 
+def _with_links(query, ctx):
+    base = dashboard_base_url(ctx)
+    dashboard = f"concat({_sql_str(base)}, url_encode(q.conversation_id))" if base else "''"
+    explorer = _sql_str(explorer_url(ctx, "genie_session_timeline"))
+    return f"""SELECT q.*,
+  {dashboard} AS dashboard_url,
+  {explorer} AS catalog_explorer_url
+FROM (
+{query}
+) q"""
+
+
 def render_query(rule, ctx):
     kind = rule.get("kind", "match")
-    query = {"match": _render_match, "sequence": _render_sequence, "custom": _render_custom}[kind](rule, ctx)
+    renderers = {"match": _render_match, "sequence": _render_sequence, "chain": _render_chain, "custom": _render_custom}
+    query = renderers[kind](rule, ctx)
     _check_query(rule["name"], query)
-    return query
+    return _with_links(query, ctx)
 
 
 def _strip_literals(sql):
@@ -499,8 +614,31 @@ def _runbook(rule, ctx):
         "- `conversation_id`, `requester`, `product`, `workspace_id`: the Genie session and who ran it.",
         "- `labels` / `detectors`: which detections fired; `fields`: where (prompt, response, tool_arguments, tool_result, ...).",
         "- `max_score`: highest detector score; `hit_count` / `turn_count`: how many findings and turns.",
-        f"- `investigate`: query over `{ctx['timeline']}`, the step-by-step session with full text. "
-        "Signals never contain prompt or result text, so it is access-controlled there.",
+        "- `dashboard_url`: the Genie session investigation dashboard, filtered to this conversation.",
+        "- Signals never contain prompt or result text; it stays in the access-controlled tables below.",
+        "",
+        "## Investigate",
+        "Replace `<conversation_id>` and `<requester>` with the values from the signal context.",
+        f"1. Timeline, in order and with full text: `SELECT step_number, started_at, event_type, event_name, tool_name, "
+        f"is_flagged, detections.flags, input_text, output_text FROM {ctx['timeline']} "
+        "WHERE conversation_id = '<conversation_id>' ORDER BY step_number`",
+        f"2. Every finding and its evidence metadata: `SELECT span_time, detector, label, score, span.field, details "
+        f"FROM {ctx['detections']} WHERE conversation_id = '<conversation_id>' AND flagged ORDER BY span_time`",
+        f"3. Session risk and what drove it: `SELECT severity, risk_score, risk, flags, activity FROM {ctx['sessions']} "
+        "WHERE conversation_id = '<conversation_id>'`",
+        f"4. The same user's other flagged sessions: `SELECT session_start, conversation_id, severity, risk_score, "
+        f"flags.flag_labels FROM {ctx['sessions']} WHERE requester = '<requester>' AND is_flagged ORDER BY session_start DESC`",
+    ]
+    links = [(t, explorer_url(ctx, t)) for t in ("genie_session_timeline", "genie_detections", "genie_sessions")]
+    if all(url for _, url in links):
+        lines.append("5. Catalog Explorer: " + ", ".join(f"[{t}]({url})" for t, url in links))
+    lines += [
+        "",
+        "## Verdict",
+        "- **True positive**: the timeline shows the behaviour described under Triage, and no known false positive applies.",
+        "- **Benign positive**: the behaviour is real but authorised (red-team testing, an approved integration, the requester's own data).",
+        "- **False positive**: a known false positive above applies, or the matched text is not what the label claims.",
+        "- Leave the alert unclassified when the timeline is missing spans or the evidence is inconclusive.",
     ]
     runbook = "\n".join(lines)
     if len(runbook) > RUNBOOK_MAX_CHARS:

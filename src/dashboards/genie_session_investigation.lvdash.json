@@ -1,0 +1,563 @@
+{
+  "datasets": [
+    {
+      "name": "ds_sessions",
+      "displayName": "Sessions",
+      "queryLines": [
+        "SELECT conversation_id, session_start, product, requester, severity,\n",
+        "       round(risk_score, 2) AS risk_score,\n",
+        "       array_join(flags.flag_labels, ', ') AS flag_labels,\n",
+        "       array_join(flags.pii_entity_types, ', ') AS pii_entity_types,\n",
+        "       activity.turn_count AS turns, activity.tool_call_count AS tool_calls,\n",
+        "       array_join(activity.tools_used, ', ') AS tools_used, context.channel AS channel\n",
+        "FROM genie_sessions\n",
+        "ORDER BY is_flagged DESC, risk_score DESC, session_start DESC\n"
+      ]
+    },
+    {
+      "name": "ds_timeline",
+      "displayName": "Session timeline",
+      "queryLines": [
+        "SELECT conversation_id, step_number, turn_number, started_at, event_type, event_name, tool_name,\n",
+        "       is_flagged, array_join(detections.flags, ', ') AS flags, outcome.outcome AS outcome,\n",
+        "       substr(input_text, 1, 2000) AS input_text, substr(output_text, 1, 2000) AS output_text\n",
+        "FROM genie_session_timeline\n",
+        "ORDER BY conversation_id, step_number\n"
+      ]
+    },
+    {
+      "name": "ds_detections",
+      "displayName": "Findings",
+      "queryLines": [
+        "SELECT conversation_id, span_time, detected_at, detector, label, round(score, 3) AS score,\n",
+        "       span.field AS field, span.trace_id AS trace_id, details\n",
+        "FROM genie_detections\n",
+        "WHERE flagged\n",
+        "ORDER BY span_time\n"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "investigate",
+      "displayName": "Investigate",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1",
+      "layout": [
+        {
+          "widget": {
+            "name": "title",
+            "multilineTextboxSpec": {
+              "lines": [
+                "# Genie session investigation\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 12,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "subtitle",
+            "multilineTextboxSpec": {
+              "lines": [
+                "Pick a conversation, or open this dashboard from a Lakewatch signal's `dashboard_url`. ",
+                "Shows the session's risk, every step with its text, and the detector findings behind each flag. ",
+                "Contains full prompt and response text: access follows the genie_tracing table grants."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 1,
+            "width": 8,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "conversation",
+            "queries": [
+              {
+                "name": "q_ds_sessions",
+                "query": {
+                  "datasetName": "ds_sessions",
+                  "fields": [
+                    {
+                      "name": "conversation_id",
+                      "expression": "`conversation_id`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "q_ds_timeline",
+                "query": {
+                  "datasetName": "ds_timeline",
+                  "fields": [
+                    {
+                      "name": "conversation_id",
+                      "expression": "`conversation_id`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "q_ds_detections",
+                "query": {
+                  "datasetName": "ds_detections",
+                  "fields": [
+                    {
+                      "name": "conversation_id",
+                      "expression": "`conversation_id`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "conversation_id",
+                    "displayName": "Conversation",
+                    "queryName": "q_ds_sessions"
+                  },
+                  {
+                    "fieldName": "conversation_id",
+                    "displayName": "Conversation",
+                    "queryName": "q_ds_timeline"
+                  },
+                  {
+                    "fieldName": "conversation_id",
+                    "displayName": "Conversation",
+                    "queryName": "q_ds_detections"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Conversation"
+              }
+            }
+          },
+          "position": {
+            "x": 8,
+            "y": 1,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "sessions",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_sessions",
+                  "fields": [
+                    {
+                      "name": "conversation_id",
+                      "expression": "`conversation_id`"
+                    },
+                    {
+                      "name": "session_start",
+                      "expression": "`session_start`"
+                    },
+                    {
+                      "name": "product",
+                      "expression": "`product`"
+                    },
+                    {
+                      "name": "requester",
+                      "expression": "`requester`"
+                    },
+                    {
+                      "name": "severity",
+                      "expression": "`severity`"
+                    },
+                    {
+                      "name": "risk_score",
+                      "expression": "`risk_score`"
+                    },
+                    {
+                      "name": "flag_labels",
+                      "expression": "`flag_labels`"
+                    },
+                    {
+                      "name": "pii_entity_types",
+                      "expression": "`pii_entity_types`"
+                    },
+                    {
+                      "name": "turns",
+                      "expression": "`turns`"
+                    },
+                    {
+                      "name": "tool_calls",
+                      "expression": "`tool_calls`"
+                    },
+                    {
+                      "name": "tools_used",
+                      "expression": "`tools_used`"
+                    },
+                    {
+                      "name": "channel",
+                      "expression": "`channel`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "conversation_id",
+                    "displayName": "Conversation"
+                  },
+                  {
+                    "fieldName": "session_start",
+                    "displayName": "Started"
+                  },
+                  {
+                    "fieldName": "product",
+                    "displayName": "Product"
+                  },
+                  {
+                    "fieldName": "requester",
+                    "displayName": "Requester"
+                  },
+                  {
+                    "fieldName": "severity",
+                    "displayName": "Severity"
+                  },
+                  {
+                    "fieldName": "risk_score",
+                    "displayName": "Risk"
+                  },
+                  {
+                    "fieldName": "flag_labels",
+                    "displayName": "Flags"
+                  },
+                  {
+                    "fieldName": "pii_entity_types",
+                    "displayName": "PII types"
+                  },
+                  {
+                    "fieldName": "turns",
+                    "displayName": "Turns"
+                  },
+                  {
+                    "fieldName": "tool_calls",
+                    "displayName": "Tool calls"
+                  },
+                  {
+                    "fieldName": "tools_used",
+                    "displayName": "Tools"
+                  },
+                  {
+                    "fieldName": "channel",
+                    "displayName": "Channel"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Session"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 3,
+            "width": 12,
+            "height": 4
+          }
+        },
+        {
+          "widget": {
+            "name": "timeline",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_timeline",
+                  "fields": [
+                    {
+                      "name": "step_number",
+                      "expression": "`step_number`"
+                    },
+                    {
+                      "name": "turn_number",
+                      "expression": "`turn_number`"
+                    },
+                    {
+                      "name": "started_at",
+                      "expression": "`started_at`"
+                    },
+                    {
+                      "name": "event_type",
+                      "expression": "`event_type`"
+                    },
+                    {
+                      "name": "event_name",
+                      "expression": "`event_name`"
+                    },
+                    {
+                      "name": "tool_name",
+                      "expression": "`tool_name`"
+                    },
+                    {
+                      "name": "is_flagged",
+                      "expression": "`is_flagged`"
+                    },
+                    {
+                      "name": "flags",
+                      "expression": "`flags`"
+                    },
+                    {
+                      "name": "outcome",
+                      "expression": "`outcome`"
+                    },
+                    {
+                      "name": "input_text",
+                      "expression": "`input_text`"
+                    },
+                    {
+                      "name": "output_text",
+                      "expression": "`output_text`"
+                    },
+                    {
+                      "name": "conversation_id",
+                      "expression": "`conversation_id`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "step_number",
+                    "displayName": "Step"
+                  },
+                  {
+                    "fieldName": "turn_number",
+                    "displayName": "Turn"
+                  },
+                  {
+                    "fieldName": "started_at",
+                    "displayName": "Time"
+                  },
+                  {
+                    "fieldName": "event_type",
+                    "displayName": "Event"
+                  },
+                  {
+                    "fieldName": "event_name",
+                    "displayName": "Name"
+                  },
+                  {
+                    "fieldName": "tool_name",
+                    "displayName": "Tool"
+                  },
+                  {
+                    "fieldName": "is_flagged",
+                    "displayName": "Flagged"
+                  },
+                  {
+                    "fieldName": "flags",
+                    "displayName": "Flags"
+                  },
+                  {
+                    "fieldName": "outcome",
+                    "displayName": "Outcome"
+                  },
+                  {
+                    "fieldName": "input_text",
+                    "displayName": "Input"
+                  },
+                  {
+                    "fieldName": "output_text",
+                    "displayName": "Output"
+                  },
+                  {
+                    "fieldName": "conversation_id",
+                    "displayName": "Conversation"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Timeline (step by step)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 7,
+            "width": 12,
+            "height": 9
+          }
+        },
+        {
+          "widget": {
+            "name": "findings",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_detections",
+                  "fields": [
+                    {
+                      "name": "span_time",
+                      "expression": "`span_time`"
+                    },
+                    {
+                      "name": "detected_at",
+                      "expression": "`detected_at`"
+                    },
+                    {
+                      "name": "detector",
+                      "expression": "`detector`"
+                    },
+                    {
+                      "name": "label",
+                      "expression": "`label`"
+                    },
+                    {
+                      "name": "score",
+                      "expression": "`score`"
+                    },
+                    {
+                      "name": "field",
+                      "expression": "`field`"
+                    },
+                    {
+                      "name": "trace_id",
+                      "expression": "`trace_id`"
+                    },
+                    {
+                      "name": "details",
+                      "expression": "`details`"
+                    },
+                    {
+                      "name": "conversation_id",
+                      "expression": "`conversation_id`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "span_time",
+                    "displayName": "Span time"
+                  },
+                  {
+                    "fieldName": "detected_at",
+                    "displayName": "Detected"
+                  },
+                  {
+                    "fieldName": "detector",
+                    "displayName": "Detector"
+                  },
+                  {
+                    "fieldName": "label",
+                    "displayName": "Label"
+                  },
+                  {
+                    "fieldName": "score",
+                    "displayName": "Score"
+                  },
+                  {
+                    "fieldName": "field",
+                    "displayName": "Field"
+                  },
+                  {
+                    "fieldName": "trace_id",
+                    "displayName": "Trace"
+                  },
+                  {
+                    "fieldName": "details",
+                    "displayName": "Details"
+                  },
+                  {
+                    "fieldName": "conversation_id",
+                    "displayName": "Conversation"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Findings (evidence metadata, no content)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 16,
+            "width": 12,
+            "height": 6
+          }
+        }
+      ]
+    }
+  ],
+  "uiSettings": {
+    "theme": {
+      "canvasBackgroundColor": {
+        "light": "#FCFCFC",
+        "dark": "#1F272D"
+      },
+      "widgetBackgroundColor": {
+        "light": "#FFFFFF",
+        "dark": "#11171C"
+      },
+      "widgetBorderColor": {
+        "light": "#FFFFFF",
+        "dark": "#11171C"
+      },
+      "fontColor": {
+        "light": "#11171C",
+        "dark": "#E8ECF0"
+      },
+      "selectionColor": {
+        "light": "#2272B4",
+        "dark": "#8ACAFF"
+      },
+      "visualizationColors": [
+        "#0072B2",
+        "#E69F00",
+        "#009E73",
+        "#CC79A7",
+        "#D55E00",
+        "#56B4E9",
+        "#F0E442"
+      ],
+      "widgetHeaderAlignment": "LEFT"
+    }
+  }
+}

@@ -40,7 +40,8 @@ resources:
           get_json_object(context, '$.labels')                       AS labels,
           get_json_object(context, '$.max_score')                    AS max_score,
           date_format(event_time, 'yyyy-MM-dd HH:mm')                AS event_utc,
-          alert_id
+          alert_id,
+          get_json_object(context, '$.dashboard_url')                AS investigate_url
         FROM ranked
         -- An unknown min severity matches nothing rather than everything.
         WHERE min_rank > 0 AND severity_rank >= min_rank
@@ -54,9 +55,10 @@ resources:
 
         @QUERY_RESULT_TABLE
 
-        **Triage** in Lakewatch: open **Alerts** and find the `alert_id`. The alert's signals carry
-        the rule's runbook, MITRE ATT&CK / ATLAS mapping and an `investigate` query. To walk a
-        session step by step:
+        **Investigate**: `investigate_url` opens the Genie session investigation dashboard filtered
+        to that conversation (timeline with text, findings, session risk). In Lakewatch, open
+        **Alerts** and find the `alert_id`: the alert's signals carry the rule's runbook and MITRE
+        ATT&CK / ATLAS mapping. Or walk a session step by step in SQL:
 
         `SELECT * FROM ${var.catalog}.${var.schema}.genie_session_timeline WHERE conversation_id = '<conversation_id>' ORDER BY step_number`
 

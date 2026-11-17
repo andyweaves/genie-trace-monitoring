@@ -13,6 +13,8 @@
 # Rule kinds:
 #   match     (default) findings matching any `match` entry, grouped to one signal per conversation
 #   sequence  a `first` finding followed by a `then` finding in the same conversation
+#   chain     named `legs`, all in one conversation: every leg but the last in any order, and the
+#             last leg at or after all of them (the lethal trifecta)
 #   custom    `query` written by hand; placeholders {detections}, {sessions}, {timeline}
 #
 # `match` entries: detector (required), labels (optional, default: any), exclude_labels,
@@ -755,10 +757,78 @@ rules:
   # ---------------------------------------------------------------------------------------------
   # Correlation and composite risk
   # ---------------------------------------------------------------------------------------------
+  - name: genie_lethal_trifecta
+    description: Lethal trifecta in one conversation - untrusted instructions and private data reached the agent, then it communicated externally.
+    summary: "Lethal trifecta (injection + private data + external communication) in {product} session {conversation_id} ({requester})"
+    severity: Critical
+    fidelity: FIDELITY_HIGH
+    category: Behavioral
+    kind: chain
+    lookback_days: 7
+    legs:
+      - name: injection
+        match:
+          - detector: prompt_injection_prompt_guard
+          - detector: prompt_injection_ai_classify
+          - detector: guardrail_signal
+            labels: [instruction_override, indirect_instruction_override, role_override_marker, injection_recognised]
+      - name: private_data
+        match:
+          - detector: pii_presidio
+            exclude_labels: [IP_ADDRESS]
+          - detector: pii_ai_extract
+            exclude_labels: [IP_ADDRESS]
+          - detector: guardrail_signal
+            labels: [credential_databricks_pat, credential_aws_access_key, credential_github_token,
+                     credential_slack_token, credential_jwt, credential_private_key, credential_google_api_key,
+                     secret_lookup_sql, secret_lookup_dbutils, credential_file_read,
+                     credential_environment_read, credential_token_api, secret_encoding_operation]
+      - name: external_communication
+        match:
+          - detector: guardrail_signal
+            labels: [external_http_write, external_sql_http_write, external_shell_upload,
+                     external_destination, external_cloud_write, markdown_image_exfil_response]
+          - detector: guardrail_signal
+            labels: [markdown_external_query]
+            fields: [response]
+    mitre:
+      - {taxonomy: mitre-atlas, tactic: Execution, technique_id: AML.T0051, technique: LLM Prompt Injection}
+      - {taxonomy: mitre-atlas, tactic: Exfiltration, technique_id: AML.T0057, technique: LLM Data Leakage}
+      - {taxonomy: mitre-atlas, tactic: Exfiltration, technique_id: AML.T0086, technique: Exfiltration via AI Agent Tool Invocation}
+      - {taxonomy: mitre-atlas, tactic: Exfiltration, technique_id: AML.T0077, technique: LLM Response Rendering}
+      - {taxonomy: mitre-attack, tactic: Exfiltration, technique_id: T1567, technique: Exfiltration Over Web Service}
+    frameworks:
+      owasp_llm: [LLM01:2025 Prompt Injection, LLM02:2025 Sensitive Information Disclosure, LLM06:2025 Excessive Agency]
+      owasp_agentic: [ASI01 Agent Goal Hijack, ASI02 Tool Misuse and Exploitation]
+      dasf: [13.16 Prompt Injection, 13.23 Data Exfiltration, 10.6 Sensitive data output from a model]
+    objective: |
+      The lethal trifecta for AI agents: an agent that has access to private data, is exposed to
+      untrusted instructions, and can communicate externally can be steered into leaking that
+      data. This rule fires when all three are observed in one Genie conversation within
+      `lookback_days`. The legs are injection (Prompt Guard, the ai_classify judge, override
+      signatures), private data in any model input or output (PII except IP addresses,
+      credential-shaped values, agent secret reads), and external communication (HTTP, curl or SQL
+      writes, non-allowlisted URLs or cloud paths in tool calls, or a Markdown image rendered in
+      Genie's answer). Injection and private data may arrive in either order; the external
+      communication must come at or after both. It is the highest-confidence sign that data left
+      through the agent.
+    triage:
+      - "Read `labels`: it lists the findings per leg (`injection: ... | private_data: ... | external_communication: ...`)."
+      - "Open `dashboard_url`, or run the timeline query below, and confirm the order: where the injected instruction came from, what private data the model saw, and which tool call or rendered image reached the outside."
+      - "Check whether the private data appears in the external call's arguments or the image URL. That is a confirmed exfiltration, not just co-occurrence."
+    false_positives:
+      - "Red-team and security testing sessions, which combine attack types by design."
+      - "A legitimate integration (webhook, cloud export) in a session where the user happened to paste PII and Prompt Guard misfired."
+    response:
+      - "Treat as a data-exposure incident: identify the destination (host, bucket) from the timeline and block it at the egress proxy or network policy."
+      - "Treat the private data in the session as disclosed. Rotate any credential and follow the data-incident process for PII."
+      - "Remove the injection source (poisoned table rows, files or documents) and review what else read it."
+      - "Break the trifecta for this agent: restrict its data access, require approval for outbound tool calls, or use serverless egress controls."
+
   - name: genie_injection_then_action
     description: A prompt-injection finding followed, in the same conversation, by exfiltration, secret access, privilege change, obfuscated execution or destructive action.
     summary: "Injection followed by agent action in {product} session {conversation_id} ({requester})"
-    severity: Critical
+    severity: High
     fidelity: FIDELITY_HIGH
     category: Behavioral
     kind: sequence
