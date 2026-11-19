@@ -44,6 +44,11 @@
 # MAGIC network requests or payload execution. Invalid configuration fails visibly rather than
 # MAGIC silently dropping rules. New findings contain metadata only; original text stays in the
 # MAGIC restricted source tables. Matcher limits are recorded as informational coverage findings.
+# MAGIC
+# MAGIC The optional confidential keyword watchlist (`confidential_keywords_file`, see
+# MAGIC `src/config/confidential_keywords.yml`) adds one signature per keyword group, labelled
+# MAGIC `confidential_keyword_<group id>`. Leave the file's `groups` empty, or the path blank, to
+# MAGIC turn it off. Adding a term re-scans the whole lookback window on the next run.
 
 # COMMAND ----------
 
@@ -55,15 +60,20 @@ from pyspark.sql import functions as F
 from pyspark.sql.functions import pandas_udf
 
 dbutils.widgets.text("security_patterns_file", "../config/security_patterns.yml", "Security-pattern YAML")
+dbutils.widgets.text("confidential_keywords_file", "../config/confidential_keywords.yml",
+                     "Confidential keyword YAML (blank = none)")
 SECURITY_CONFIG = load_security_config(os.path.abspath(dbutils.widgets.get("security_patterns_file")))
-scan_security_text = build_security_matcher(SECURITY_CONFIG)
+_keywords_file = dbutils.widgets.get("confidential_keywords_file").strip()
+KEYWORD_RULES = load_keyword_rules(os.path.abspath(_keywords_file) if _keywords_file else "")
+scan_security_text = build_security_matcher(with_keyword_rules(SECURITY_CONFIG, KEYWORD_RULES))
 RUNAWAY_CONFIG = SECURITY_CONFIG.get("runaway", {})
 LOOP_MIN_CALLS = int(RUNAWAY_CONFIG.get("repeat_calls", 5))
 LONG_TURN_MINUTES = int(RUNAWAY_CONFIG.get("long_turn_minutes", 60))
 SPAN_CAP_HINT = int(RUNAWAY_CONFIG.get("span_cap_hint", 120))
 if min(LOOP_MIN_CALLS, LONG_TURN_MINUTES, SPAN_CAP_HINT) <= 0:
     raise ValueError("Runaway thresholds must be positive integers")
-print(f"Loaded {len(SECURITY_CONFIG['rules'])} deterministic security patterns")
+print(f"Loaded {len(SECURITY_CONFIG['rules'])} deterministic security patterns "
+      f"and {len(KEYWORD_RULES)} confidential keyword groups")
 
 # COMMAND ----------
 

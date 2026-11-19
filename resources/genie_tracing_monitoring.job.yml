@@ -27,6 +27,8 @@ resources:
           default: ${var.pii_allowlist_files}
         - name: security_patterns_file
           default: ${var.security_patterns_file}
+        - name: confidential_keywords_file
+          default: ${var.confidential_keywords_file}
 
       environments:
         # PII task only: Presidio + spaCy and the model wheel staged by 00_setup. Kept separate so a

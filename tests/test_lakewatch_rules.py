@@ -66,8 +66,11 @@ class CoverageTests(unittest.TestCase):
 
     def test_each_flagged_label_has_one_primary_rule(self):
         # A label may appear in several match rules only when they split it by source field.
+        # Rate rules count labels that a match rule already signals, so they are not owners.
         owners = {}
         for rule in CATALOG["rules"]:
+            if rule.get("kind", "match") != "match":
+                continue
             for entry in rule.get("match") or []:
                 for label in entry.get("labels") or []:
                     owners.setdefault((entry["detector"], label), []).append((rule["name"], entry.get("fields")))
@@ -257,6 +260,65 @@ class TrifectaAndLinkTests(unittest.TestCase):
             sql = "".join(d["queryLines"])
             self.assertRegex(sql, r"\bconversation_id\b")
             self.assertNotRegex(sql, r"(?i)\bFROM\s+\S+\.\S+", "dashboard queries must use bare table names")
+
+
+class KeywordAndRateRuleTests(unittest.TestCase):
+    def test_confidential_keyword_rule_matches_the_watchlist_prefix(self):
+        spec = importlib.util.spec_from_file_location("security_pattern_utils", ROOT / "src/notebooks/_security_pattern_utils.py")
+        security = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(security)
+        entry = RULES["genie_confidential_keyword"]["match"][0]
+        self.assertEqual(entry["label_prefixes"], [security.KEYWORD_LABEL_PREFIX])
+        query = PAYLOADS["genie_confidential_keyword"]["batch"]["sql"]["query"]
+        self.assertIn("startswith(label, 'confidential_keyword_')", query)
+        self.assertNotIn("LIKE 'confidential_keyword_", query)
+        self.assertEqual(PAYLOADS["genie_confidential_keyword"]["annotations"]["detection_labels"], "confidential_keyword_*")
+
+    def test_labels_and_prefixes_combine_with_or(self):
+        predicate = UTILS.match_predicate({"detector": "guardrail_signal", "labels": ["a_label"],
+                                           "label_prefixes": ["b_prefix_"]})
+        self.assertIn("(label IN ('a_label') OR startswith(label, 'b_prefix_'))", predicate)
+
+    def test_rate_rules(self):
+        expected = {
+            "genie_repeat_offender": (["requester"], "turns", 5),
+            "genie_agent_stuck_on_block": (["requester", "tool_name"], "spans", 5),
+            "genie_approval_spike": (["requester"], "spans", 10),
+        }
+        rate = {n: (r["per"], r["distinct"], r["threshold"]) for n, r in RULES.items() if r.get("kind") == "rate"}
+        self.assertEqual(rate, expected)
+        for name in expected:
+            query = PAYLOADS[name]["batch"]["sql"]["query"]
+            self.assertIn("RANGE BETWEEN CURRENT ROW AND INTERVAL 60 MINUTES FOLLOWING", query, name)
+            self.assertIn("max(CASE WHEN IN_TIMERANGE(detected_at) THEN 1 ELSE 0 END) AS is_new", query, name)
+            self.assertEqual(PAYLOADS[name]["annotations"]["rule_kind"], "rate")
+        self.assertIn("PARTITION BY requester, tool_name", PAYLOADS["genie_agent_stuck_on_block"]["batch"]["sql"]["query"])
+        self.assertIn("refusal_text", RULES["genie_repeat_offender"]["match"][0]["labels"])
+        self.assertTrue(RULES["genie_approval_spike"]["match"][0]["include_unflagged"])
+        self.assertIn("approval_requested", CATALOG["not_signalled"]["guardrail_signal"])
+
+    def test_rate_validation(self):
+        import copy
+
+        for mutate, message in (
+            (lambda r: r.update(threshold=1), "threshold"),
+            (lambda r: r.update(window="1d"), "minutes or hours"),
+            (lambda r: r.update(window="25h"), "between 1m and 24h"),
+            (lambda r: r.update(per=["tool_name"]), "per must list requester"),
+            (lambda r: r.update(per=["requester", "conversation_id"]), "per must list requester"),
+            (lambda r: r.update(distinct="findings"), "distinct"),
+            (lambda r: r["match"][0].update(label_prefixes=["Bad%"]), "invalid label prefix"),
+        ):
+            catalog = copy.deepcopy(CATALOG)
+            mutate(next(r for r in catalog["rules"] if r["name"] == "genie_repeat_offender"))
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                UTILS.validate_catalog(catalog)
+
+    def test_rate_window_minutes(self):
+        self.assertEqual(UTILS.rate_window_minutes("1h"), 60)
+        self.assertEqual(UTILS.rate_window_minutes("30m"), 30)
+        with self.assertRaises(ValueError):
+            UTILS.rate_window_minutes("1h30m")
 
 
 class PlanTests(unittest.TestCase):

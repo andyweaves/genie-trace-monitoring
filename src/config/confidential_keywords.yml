@@ -1,0 +1,29 @@
+# Confidential keyword watchlist for 04_detect_guardrail_signals.
+#
+# Terms you never expect in Genie prompts or answers: project codenames, deal names, customer
+# lists. Each group becomes a deterministic signature, and every match writes a guardrail_signal
+# finding labelled `confidential_keyword_<id>`, promoted to Lakewatch by the
+# genie_confidential_keyword rule.
+#
+# * `id`: neutral, lowercase identifier. It appears in Lakewatch signals and the email digest,
+#   so it must not contain the terms (loading fails if it does). Use codename_1, deal_a, ...
+# * `terms`: matched as whole words, case-insensitively, with any whitespace between the words of
+#   a multi-word term. Encoded copies (base64, URL, JSON, ...) are found by the same bounded
+#   decoding as the other security signatures. Up to 256 terms per group.
+# * `scopes` (optional): where to look. Default [prompt, answer]. Add tool_args to catch the
+#   term in code or SQL Genie runs, and tool_result to catch it in data Genie reads (noisier).
+# * `score` (optional): severity added to the session risk score, default 0.6.
+#
+# The matched term is never written to findings or signals: an analyst sees which group matched
+# and follows the investigation link to the full text behind the table access controls.
+# Adding or changing a term re-scans the detection lookback window (7 days by default) on the next
+# run, so expect a one-off backfill of older mentions.
+#
+# Point the `confidential_keywords_file` bundle variable at your own copy to keep the list out of
+# this repository, or set it to "" to turn the watchlist off.
+version: 1
+groups: []
+# groups:
+#   - id: codename_1
+#     terms: [reyden, project reyden]
+#     scopes: [prompt, answer]

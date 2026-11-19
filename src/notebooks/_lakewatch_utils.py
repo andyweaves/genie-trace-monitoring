@@ -29,7 +29,7 @@ SEVERITIES = ("Informational", "Low", "Medium", "High", "Critical")
 FIDELITIES = ("FIDELITY_DEVELOPMENT", "FIDELITY_INVESTIGATIVE", "FIDELITY_MEDIUM", "FIDELITY_HIGH")
 DEFAULT_CATEGORIES = ("Static Signature", "Fuzzy Signature", "Behavioral", "Statistical", "Learning (AI/ML)")
 DEDUPLICATION_MODES = ("DEDUPLICATION_DEFAULT", "DEDUPLICATION_ENABLED", "DEDUPLICATION_DISABLED")
-KINDS = ("match", "sequence", "chain", "custom")
+KINDS = ("match", "sequence", "chain", "rate", "custom")
 DETECTORS = (
     "pii_presidio", "pii_ai_extract", "prompt_injection_prompt_guard",
     "prompt_injection_ai_classify", "guardrail_signal",
@@ -67,6 +67,11 @@ OUTPUT_COLUMNS = (
 LINK_COLUMNS = ("dashboard_url", "catalog_explorer_url")
 CONTEXT_KEYS = tuple(c for c in OUTPUT_COLUMNS if c != "event_time") + LINK_COLUMNS
 LEG_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
+LABEL_PREFIX_RE = re.compile(r"^[a-z][a-z0-9_]{1,64}$")
+# `rate` rules: what to count per group, and the columns a group may be keyed on.
+RATE_DISTINCT = {"turns": "trace_id", "spans": "span_id"}
+RATE_PER = ("requester", "tool_name")
+RATE_WINDOW_RE = re.compile(r"^(\d+)([mh])$")
 # Filter on the investigation dashboard that deep links set: page `investigate`, widget
 # `conversation` (names pinned in src/dashboards/genie_session_investigation.lvdash.json).
 DASHBOARD_FILTER = "f_investigate~conversation"
@@ -118,7 +123,7 @@ def load_catalog(path):
 
 def _match_entries(rule):
     kind = rule.get("kind", "match")
-    if kind == "match":
+    if kind in ("match", "rate"):
         return list(rule.get("match") or [])
     if kind == "sequence":
         return list(rule.get("first") or []) + list(rule.get("then") or [])
@@ -131,7 +136,8 @@ def _validate_match(entry, where, problems):
     if not isinstance(entry, dict):
         problems.append(f"{where}: match entry must be a mapping")
         return
-    unknown = set(entry) - {"detector", "labels", "exclude_labels", "fields", "min_score", "include_unflagged"}
+    unknown = set(entry) - {"detector", "labels", "label_prefixes", "exclude_labels", "fields", "min_score",
+                            "include_unflagged"}
     if unknown:
         problems.append(f"{where}: unknown match keys {sorted(unknown)}")
     if entry.get("detector") not in DETECTORS:
@@ -146,6 +152,14 @@ def _validate_match(entry, where, problems):
         for label in values:
             if not isinstance(label, str) or not LABEL_RE.match(label):
                 problems.append(f"{where}: invalid label {label!r}")
+    prefixes = entry.get("label_prefixes")
+    if prefixes is not None:
+        if not isinstance(prefixes, list) or not prefixes:
+            problems.append(f"{where}: label_prefixes must be a non-empty list")
+        else:
+            for prefix in prefixes:
+                if not isinstance(prefix, str) or not LABEL_PREFIX_RE.match(prefix):
+                    problems.append(f"{where}: invalid label prefix {prefix!r}")
     for field in entry.get("fields") or []:
         if field not in SOURCE_FIELDS:
             problems.append(f"{where}: field {field!r} not in {SOURCE_FIELDS}")
@@ -183,6 +197,32 @@ def _validate_mitre(mappings, where, problems):
         if key in seen:
             problems.append(f"{w}: duplicate mapping {key}")
         seen.add(key)
+
+
+def rate_window_minutes(window):
+    """Minutes in a rate window such as 30m or 1h."""
+    parsed = RATE_WINDOW_RE.match(str(window))
+    if not parsed:
+        raise ValueError(f"rate window {window!r} must be minutes or hours, e.g. 30m or 1h")
+    return int(parsed.group(1)) * (60 if parsed.group(2) == "h" else 1)
+
+
+def _validate_rate(rule, where, problems):
+    if not rule.get("match"):
+        problems.append(f"{where}: rate rules need at least one match entry")
+    threshold = rule.get("threshold")
+    if type(threshold) is not int or not 2 <= threshold <= 100000:
+        problems.append(f"{where}: rate threshold must be an integer >= 2")
+    try:
+        if not 1 <= rate_window_minutes(rule.get("window")) <= 24 * 60:
+            problems.append(f"{where}: rate window must be between 1m and 24h")
+    except ValueError as e:
+        problems.append(f"{where}: {e}")
+    per = rule.get("per")
+    if not isinstance(per, list) or "requester" not in per or set(per) - set(RATE_PER) or len(set(per)) != len(per):
+        problems.append(f"{where}: rate per must list requester and optionally tool_name")
+    if rule.get("distinct") not in RATE_DISTINCT:
+        problems.append(f"{where}: rate distinct must be one of {sorted(RATE_DISTINCT)}")
 
 
 def validate_catalog(catalog, categories=DEFAULT_CATEGORIES):
@@ -235,6 +275,8 @@ def validate_catalog(catalog, categories=DEFAULT_CATEGORIES):
             for leg in legs:
                 if not LEG_NAME_RE.match(str(leg.get("name", ""))) or not leg.get("match"):
                     problems.append(f"{where}: each chain leg needs a name matching {LEG_NAME_RE.pattern} and match entries")
+        if kind == "rate":
+            _validate_rate(rule, where, problems)
         if kind == "custom" and not str(rule.get("query") or "").strip():
             problems.append(f"{where}: custom rules need a query")
         for j, entry in enumerate(_match_entries(rule)):
@@ -322,6 +364,10 @@ def explorer_url(ctx, table):
 # MAGIC   the last in any order, and the last leg at or after all of them, e.g. the lethal trifecta:
 # MAGIC   untrusted instructions and private data, then external communication. Fires when any of the
 # MAGIC   evidence is new in the window.
+# MAGIC * `rate`: at least `threshold` distinct turns or spans matching `match`, per requester (and
+# MAGIC   optionally tool), inside any sliding `window` (e.g. 1h) over `lookback_days`, where the
+# MAGIC   window holds a finding new in this run. One signal per requester (and tool), linked to the
+# MAGIC   latest conversation in the burst.
 # MAGIC * `custom`: hand-written SQL with `{detections}`, `{sessions}`, `{timeline}`,
 # MAGIC   `{lookback_days}` and `{investigate}` placeholders.
 
@@ -340,8 +386,14 @@ def match_predicate(entry):
     parts = [f"detector = {_sql_str(entry['detector'])}"]
     if not entry.get("include_unflagged"):
         parts.append("flagged")
+    label_terms = []
     if entry.get("labels"):
-        parts.append(f"label IN {_sql_list(entry['labels'])}")
+        label_terms.append(f"label IN {_sql_list(entry['labels'])}")
+    for prefix in entry.get("label_prefixes") or []:
+        # startswith, not LIKE: `_` in a label prefix is literal, not a wildcard.
+        label_terms.append(f"startswith(label, {_sql_str(prefix)})")
+    if label_terms:
+        parts.append("(" + " OR ".join(label_terms) + ")")
     if entry.get("exclude_labels"):
         parts.append(f"coalesce(label, '') NOT IN {_sql_list(entry['exclude_labels'])}")
     if "min_score" in entry:
@@ -370,7 +422,7 @@ def _base_cte(detections, time_filter):
     coalesce(d.conversation_id, d.span.trace_id) AS conversation_id,
     d.requester, d.product, d.workspace_id, d.span_time, d.detected_at,
     d.detector, d.flagged, d.label, d.score,
-    d.span.trace_id AS trace_id,
+    d.span.trace_id AS trace_id, d.span.span_id AS span_id,
     CASE WHEN d.span.field LIKE 'security:%' THEN get_json_object(d.details, '$.source_field')
          WHEN d.detector = 'guardrail_signal' THEN NULL
          ELSE d.span.field END AS source_field,
@@ -509,6 +561,71 @@ WHERE conversation_id IN (SELECT conversation_id FROM new_conversations)
 GROUP BY conversation_id"""
 
 
+def _render_rate(rule, ctx):
+    days = int(rule.get("lookback_days", 7))
+    minutes = rate_window_minutes(rule["window"])
+    unit = RATE_DISTINCT[rule["distinct"]]
+    keys = list(rule["per"])
+    key_list = ", ".join(keys)
+    key_join = " AND ".join(f"{{a}}.{k} = {{b}}.{k}" for k in keys)
+    not_null = " AND ".join(f"{k} IS NOT NULL" for k in keys)
+    time_filter = f"d.span_time >= TIMERANGE_NOW() - INTERVAL {days} DAYS"
+    return f"""WITH {_base_cte(ctx['detections'], time_filter)},
+hits AS (
+  SELECT * FROM base
+  WHERE {_any_of(rule['match'])}
+    AND {not_null}
+),
+units AS (
+  -- One row per distinct {rule['distinct'][:-1]}: when it happened and whether it is new in this run
+  SELECT {key_list}, {unit} AS unit_id, min(span_time) AS unit_time,
+         max(CASE WHEN IN_TIMERANGE(detected_at) THEN 1 ELSE 0 END) AS is_new
+  FROM hits
+  GROUP BY {key_list}, {unit}
+),
+windows AS (
+  -- Every unit starts a candidate {rule['window']} window; count the units inside it
+  SELECT {key_list}, unit_time AS window_start,
+    count(*) OVER w AS units_in_window,
+    max(is_new) OVER w AS has_new
+  FROM units
+  WINDOW w AS (PARTITION BY {key_list} ORDER BY unit_time
+               RANGE BETWEEN CURRENT ROW AND INTERVAL {minutes} MINUTES FOLLOWING)
+),
+bursts AS (
+  -- Windows at or over the threshold that contain at least one new finding
+  SELECT * FROM windows WHERE units_in_window >= {int(rule['threshold'])} AND has_new = 1
+),
+evidence AS (
+  SELECT DISTINCT h.*, b.units_in_window
+  FROM hits h
+  JOIN units u ON {key_join.format(a='u', b='h')} AND u.unit_id = h.{unit}
+  JOIN bursts b ON {key_join.format(a='b', b='u')}
+    AND u.unit_time BETWEEN b.window_start AND b.window_start + INTERVAL {minutes} MINUTES
+),
+per_group AS (
+  SELECT
+  -- Per-requester signal; conversation_id is the latest conversation in the burst, for the links
+  max_by(conversation_id, span_time)                                  AS conversation_id,
+  max(requester)                                                      AS requester,
+  array_join(array_sort(collect_set(product)), ', ')                  AS product,
+  max(workspace_id)                                                   AS workspace_id,
+  min(span_time)                                                      AS event_time,
+  max(units_in_window)                                                AS hit_count,
+  count(DISTINCT trace_id)                                            AS turn_count,
+  round(max(score), 3)                                                AS max_score,
+  array_join(array_sort(collect_set(label)), ', ')                    AS labels,
+  array_join(array_sort(collect_set(detector)), ', ')                 AS detectors,
+  array_join(array_sort(collect_set(source_field)), ', ')             AS fields,
+  array_join(array_sort(collect_set(tool_name)), ', ')                AS tools,
+  array_join(slice(array_sort(collect_set(trace_id)), 1, 10), ', ')   AS trace_ids
+  FROM evidence
+  GROUP BY {key_list}
+)
+SELECT *, {_investigate(ctx['timeline'])} AS investigate
+FROM per_group"""
+
+
 def _render_custom(rule, ctx):
     query = rule["query"].strip()
     for key, value in (
@@ -537,7 +654,8 @@ FROM (
 
 def render_query(rule, ctx):
     kind = rule.get("kind", "match")
-    renderers = {"match": _render_match, "sequence": _render_sequence, "chain": _render_chain, "custom": _render_custom}
+    renderers = {"match": _render_match, "sequence": _render_sequence, "chain": _render_chain,
+                 "rate": _render_rate, "custom": _render_custom}
     query = renderers[kind](rule, ctx)
     _check_query(rule["name"], query)
     return _with_links(query, ctx)
@@ -667,6 +785,7 @@ def _annotations(rule):
     for entry in _match_entries(rule):
         detectors.add(entry["detector"])
         labels.update(entry.get("labels") or [])
+        labels.update(prefix + "*" for prefix in entry.get("label_prefixes") or [])
     out = {
         "managed_by": MANAGED_BY,
         "source_repo": REPO_URL,

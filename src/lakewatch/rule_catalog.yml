@@ -15,9 +15,13 @@
 #   sequence  a `first` finding followed by a `then` finding in the same conversation
 #   chain     named `legs`, all in one conversation: every leg but the last in any order, and the
 #             last leg at or after all of them (the lethal trifecta)
+#   rate      at least `threshold` distinct `turns` or `spans` matching `match` from one requester
+#             (`per: [requester]`, or `[requester, tool_name]`) inside any sliding `window` (e.g.
+#             1h). One signal per requester (and tool); conversation_id is the latest in the burst
 #   custom    `query` written by hand; placeholders {detections}, {sessions}, {timeline}
 #
-# `match` entries: detector (required), labels (optional, default: any), exclude_labels,
+# `match` entries: detector (required), labels (optional, default: any), label_prefixes (labels
+# starting with any of these, e.g. the customer-named confidential_keyword_* groups), exclude_labels,
 # fields (source field: prompt | response | tool_arguments | tool_result | model_output |
 # embedded_tool_result), min_score, include_unflagged (default false).
 #
@@ -37,7 +41,7 @@ defaults:
 # genie_detections (no session flag, no risk score) and would only add noise.
 not_signalled:
   guardrail_signal:
-    - approval_requested          # the approval guardrail working as designed
+    - approval_requested          # the approval guardrail working as designed; only signalled in volume (genie_approval_spike)
     - turn_error
     - tool_error
     - cancelled_or_aborted
@@ -688,6 +692,37 @@ rules:
     response:
       - "Tag and mask the source column if the data should not reach the model."
 
+  - name: genie_confidential_keyword
+    description: A term from the confidential keyword watchlist (codename, deal or customer name) appeared in Genie text.
+    summary: "Confidential keyword ({labels}) in {product} session {conversation_id} ({requester})"
+    severity: Medium
+    fidelity: FIDELITY_MEDIUM
+    category: Static Signature
+    match:
+      - detector: guardrail_signal
+        label_prefixes: [confidential_keyword_]
+    mitre:
+      - {taxonomy: mitre-atlas, tactic: Exfiltration, technique_id: AML.T0057, technique: LLM Data Leakage}
+    frameworks:
+      owasp_llm: [LLM02:2025 Sensitive Information Disclosure]
+      dasf: [9.10 Accidental exposure of unauthorized data to models, 10.6 Sensitive data output from a model]
+    objective: |
+      Promotes matches from the customer-configured watchlist in src/config/confidential_keywords.yml
+      (variable confidential_keywords_file): terms such as project codenames that should not reach
+      a model. `labels` names the keyword group (confidential_keyword_<group id>), never the term.
+      In a prompt the user disclosed it; in an answer or tool result Genie surfaced it from data.
+      Nothing fires until groups are added to the file.
+    triage:
+      - "Check `fields`: a prompt means the user typed it, a response or tool result means Genie found it in data it can read."
+      - "Open the timeline to see the term in context. The finding records the group, not the matched text."
+      - "Check whether the requester is on the project. Mentions by its own team are expected."
+    false_positives:
+      - "Project members discussing their own project, where the space is approved for it."
+      - "Common words used as codenames. Add a more specific multi-word term to the group."
+    response:
+      - "If the term should not be in Genie's data, find the table or file it came from and restrict or mask it."
+      - "If a user disclosed it, follow your data-handling process and remind them of the policy."
+
   - name: genie_pii_combination
     description: A person's name together with a date of birth, phone number or location in the same session.
     summary: "Identifiable person (name plus DOB/phone/location) in {product} session {conversation_id} ({requester})"
@@ -753,6 +788,114 @@ rules:
       - "Public figures with locations, and CRM data the requester is entitled to."
     response:
       - "Tag and mask the source columns. Check that the space or agent only exposes the data it needs."
+
+  # ---------------------------------------------------------------------------------------------
+  # Volume per requester (rate rules over a sliding window)
+  # ---------------------------------------------------------------------------------------------
+  - name: genie_repeat_offender
+    description: One requester had five or more blocked or refused Genie turns within an hour.
+    summary: "{requester} had {hit_count} blocked or refused Genie turns within an hour ({product})"
+    severity: Medium
+    fidelity: FIDELITY_MEDIUM
+    category: Statistical
+    kind: rate
+    match:
+      - detector: guardrail_signal
+        labels: [guardrail_intervention, guardrail_intervention_tool, tool_policy_blocked,
+                 tool_permission_denied, refusal_text, refusal_outcome]
+    per: [requester]
+    distinct: turns
+    threshold: 5
+    window: 1h
+    mitre:
+      - {taxonomy: mitre-atlas, tactic: Privilege Escalation, technique_id: AML.T0054, technique: LLM Jailbreak}
+      - {taxonomy: mitre-atlas, tactic: Defense Evasion, technique_id: AML.T0054, technique: LLM Jailbreak}
+    frameworks:
+      owasp_llm: [LLM01:2025 Prompt Injection]
+      owasp_agentic: [ASI01 Agent Goal Hijack]
+      dasf: [9.1 Prompt inject]
+    objective: |
+      A single block or refusal is routine; many from one person in a short time is probing, or an
+      app or script stuck on a request it may not make. Counts distinct turns, across every
+      conversation of the requester, with a guardrail intervention, a policy-blocked or
+      permission-denied tool call, or a refusal, in any sliding one-hour window. Signals are per
+      requester. conversation_id and the links point to the latest conversation in the burst.
+    triage:
+      - "List the requester's blocks and refusals: `SELECT span_time, conversation_id, label FROM genie_detections WHERE requester = '<requester>' AND flagged AND detector = 'guardrail_signal' ORDER BY span_time DESC`."
+      - "Read the prompts in a few of the conversations. Rephrasing the same forbidden request is the pattern to look for."
+    false_positives:
+      - "A user without access to a table retrying a normal question several times."
+      - "Red-team or evaluation runs."
+    response:
+      - "Contact the requester or the owner of the app. For a service principal, check what drives it."
+
+  - name: genie_agent_stuck_on_block
+    description: The same tool was blocked or denied five or more times for one requester within an hour.
+    summary: "{tools} blocked {hit_count} times within an hour for {requester} ({product})"
+    severity: Medium
+    fidelity: FIDELITY_MEDIUM
+    category: Behavioral
+    kind: rate
+    match:
+      - detector: guardrail_signal
+        labels: [tool_policy_blocked, tool_permission_denied, guardrail_intervention_tool]
+    per: [requester, tool_name]
+    distinct: spans
+    threshold: 5
+    window: 1h
+    mitre:
+      - {taxonomy: mitre-atlas, tactic: Execution, technique_id: AML.T0053, technique: AI Agent Tool Invocation}
+      - {taxonomy: mitre-atlas, tactic: Impact, technique_id: AML.T0034, technique: Cost Harvesting,
+         sub_technique_id: AML.T0034.002, sub_technique: Agentic Resource Consumption}
+    frameworks:
+      owasp_llm: [LLM06:2025 Excessive Agency]
+      owasp_agentic: [ASI02 Tool Misuse and Exploitation]
+      dasf: [13.2 Tool Misuse, 13.4 Resource Overload]
+    objective: |
+      An agent that keeps calling a tool its guardrails or permissions refuse is either looping or
+      looking for a way around the control. Counts distinct tool-call spans per requester and tool
+      that were policy-blocked, permission-denied, or answered with the classifier's "Action
+      denied" wording, in any sliding one-hour window, across conversations.
+    triage:
+      - "Check whether the arguments change between attempts (`investigate`). Changing arguments to reach the same goal is an evasion attempt; identical ones are a loop."
+      - "Check what the agent did after the last block."
+    false_positives:
+      - "An agent retrying a call that needs a grant the user does not have."
+    response:
+      - "Stop the session or scheduled task if it is still running. Grant the access if it is legitimate, or fix the prompt or agent instructions."
+
+  - name: genie_approval_spike
+    description: One requester was asked to approve ten or more Genie actions within an hour.
+    summary: "{requester} was asked for {hit_count} approvals within an hour ({product})"
+    severity: Low
+    fidelity: FIDELITY_INVESTIGATIVE
+    category: Statistical
+    kind: rate
+    match:
+      - detector: guardrail_signal
+        labels: [approval_requested]
+        include_unflagged: true
+    per: [requester]
+    distinct: spans
+    threshold: 10
+    window: 1h
+    mitre:
+      - {taxonomy: mitre-atlas, tactic: Execution, technique_id: AML.T0053, technique: AI Agent Tool Invocation}
+    frameworks:
+      owasp_llm: [LLM06:2025 Excessive Agency]
+      owasp_agentic: [ASI09 Human-Agent Trust Exploitation]
+    objective: |
+      Approval prompts are the control working, but a flood of them trains people to approve
+      without reading (approval fatigue), and a steered agent can use that to slip a harmful action
+      through. Counts approval requests per requester in any sliding one-hour window, across
+      conversations. Single approval requests stay unsignalled (not_signalled).
+    triage:
+      - "Check which actions were proposed (`tools`) and which were approved: the timeline shows each approval and the call that followed."
+      - "Look for a destructive or external action approved late in the burst."
+    false_positives:
+      - "Heavy Genie Code users editing many assets in one sitting."
+    response:
+      - "Consider Auto-approve for routine actions so the prompts that remain get attention."
 
   # ---------------------------------------------------------------------------------------------
   # Correlation and composite risk
