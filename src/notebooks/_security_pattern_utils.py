@@ -298,3 +298,103 @@ def build_security_matcher(config):
         return {"hits": hits, "limits": sorted(reached), "scanned_chars": len(original)}
 
     return scan
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Confidential keyword watchlist
+# MAGIC
+# MAGIC Customer-configured terms (codenames, deal names, customer lists) from a separate YAML file,
+# MAGIC turned into ordinary security signatures so they get the same scopes, passive decoding and
+# MAGIC value-free evidence. Each group becomes one signature labelled
+# MAGIC `confidential_keyword_<group id>`. The label reaches Lakewatch signals, so the group ID must
+# MAGIC not contain its own terms: use a neutral ID such as `codename_1`. Terms match whole words,
+# MAGIC case-insensitively, with any run of whitespace between the words of a multi-word term.
+
+# COMMAND ----------
+
+KEYWORD_LABEL_PREFIX = "confidential_keyword_"
+_KEYWORD_DEFAULT_SCOPES = ["prompt", "answer"]
+_KEYWORD_DEFAULT_SCORE = 0.6
+_KEYWORD_MAX_GROUPS = 64
+_KEYWORD_MAX_TERMS = 256
+_KEYWORD_MAX_TERM_CHARS = 128
+_KEYWORD_PATTERN_CHARS = 3500
+
+
+def _keyword_pattern(terms):
+    alternatives = ["\\s{1,8}".join(re.escape(word) for word in term.split()) for term in terms]
+    return "(?i)(?<!\\w)(?:" + "|".join(alternatives) + ")(?!\\w)"
+
+
+def keyword_rules(config):
+    """Validate a keyword watchlist and return it as security-matcher rules (possibly empty)."""
+    if config is None:
+        return []
+    if not isinstance(config, dict) or set(config) - {"version", "groups"}:
+        raise ValueError("Keyword configuration must be a mapping with only version and groups")
+    if type(config.get("version", 1)) is not int or config.get("version", 1) != 1:
+        raise ValueError("Unsupported keyword configuration version")
+    groups = config.get("groups") or []
+    if not isinstance(groups, list) or len(groups) > _KEYWORD_MAX_GROUPS:
+        raise ValueError(f"groups must be a list of at most {_KEYWORD_MAX_GROUPS} keyword groups")
+    rules, ids = [], set()
+    for group in groups:
+        if not isinstance(group, dict) or set(group) - {"id", "terms", "scopes", "score"}:
+            raise ValueError("Each keyword group must be a mapping of id, terms, scopes and score")
+        identifier = group.get("id")
+        if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,57}", identifier) or identifier in ids:
+            raise ValueError("Keyword group IDs must be unique lowercase identifiers of at most 58 characters")
+        ids.add(identifier)
+        terms = group.get("terms")
+        if (not isinstance(terms, list) or not 1 <= len(terms) <= _KEYWORD_MAX_TERMS
+                or any(not isinstance(term, str) or not term.strip() or len(term) > _KEYWORD_MAX_TERM_CHARS
+                       for term in terms)):
+            raise ValueError(f"Keyword group {identifier}: terms must be 1..{_KEYWORD_MAX_TERMS} non-empty "
+                             f"strings of at most {_KEYWORD_MAX_TERM_CHARS} characters")
+        terms = sorted({" ".join(term.split()) for term in terms}, key=lambda term: (-len(term), term.lower()))
+        for term in terms:
+            slug = re.sub(r"[^a-z0-9]+", "_", term.lower()).strip("_")
+            if slug and re.search(rf"(?:^|_){re.escape(slug)}(?:_|$)", identifier):
+                raise ValueError(f"Keyword group {identifier}: the ID contains one of its terms, and IDs reach "
+                                 "Lakewatch signals. Use a neutral ID such as codename_1")
+        scopes = group.get("scopes", _KEYWORD_DEFAULT_SCOPES)
+        if (not isinstance(scopes, list) or not scopes
+                or any(not isinstance(scope, str) for scope in scopes) or set(scopes) - _SECURITY_SCOPES):
+            raise ValueError(f"Keyword group {identifier}: scopes must be a subset of {sorted(_SECURITY_SCOPES)}")
+        score = group.get("score", _KEYWORD_DEFAULT_SCORE)
+        if type(score) not in (int, float) or not 0 < score <= 1:
+            raise ValueError(f"Keyword group {identifier}: score must be a number in (0, 1]")
+        # Split long lists over several patterns so each stays within the validator's size limit.
+        chunks, current = [], []
+        for term in terms:
+            if current and len(_keyword_pattern(current + [term])) > _KEYWORD_PATTERN_CHARS:
+                chunks.append(current)
+                current = []
+            current.append(term)
+        chunks.append(current)
+        if len(chunks) > 16:
+            raise ValueError(f"Keyword group {identifier}: too many terms; split it into several groups")
+        rules.append({
+            "id": KEYWORD_LABEL_PREFIX + identifier, "category": "confidential_keyword",
+            "scopes": list(scopes), "score": score, "flagged": True,
+            "source": "confidential_keywords", "patterns": [_keyword_pattern(chunk) for chunk in chunks],
+        })
+    return rules
+
+
+def load_keyword_rules(path):
+    """Keyword rules from a watchlist YAML file; a blank path means no watchlist."""
+    if not path or not str(path).strip():
+        return []
+    import yaml
+
+    with open(path, encoding="utf-8") as handle:
+        return keyword_rules(yaml.safe_load(handle))
+
+
+def with_keyword_rules(config, rules):
+    """The security configuration plus keyword rules, validated together (unique IDs, limits)."""
+    merged = dict(config, rules=list(config["rules"]) + list(rules))
+    build_security_matcher(merged)
+    return merged

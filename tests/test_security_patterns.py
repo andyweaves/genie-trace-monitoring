@@ -185,5 +185,86 @@ class SecurityPatternTests(unittest.TestCase):
         self.assertIn("credential_databricks_pat", self.ids("fake example: " + FAKE_PAT, "answer"))
 
 
+
+class ConfidentialKeywordTests(unittest.TestCase):
+    WATCHLIST = {"version": 1, "groups": [{"id": "codename_1", "terms": ["reyden", "project reyden"]}]}
+
+    def scan(self, watchlist=None):
+        rules = UTILS.keyword_rules(watchlist or self.WATCHLIST)
+        return UTILS.build_security_matcher(UTILS.with_keyword_rules(CONFIG, rules))
+
+    def labels(self, scan, text, scope="prompt"):
+        return {hit["rule_id"] for hit in scan(text, scope)["hits"]}
+
+    def test_shipped_watchlist_is_empty_and_valid(self):
+        self.assertEqual(UTILS.load_keyword_rules(ROOT / "src/config/confidential_keywords.yml"), [])
+        self.assertEqual(UTILS.load_keyword_rules(""), [])
+
+    def test_commented_example_is_valid(self):
+        import yaml
+
+        text = (ROOT / "src/config/confidential_keywords.yml").read_text()
+        example = "\n".join(line[2:] for line in text[text.index("# groups:"):].splitlines())
+        rules = UTILS.keyword_rules({"version": 1, **yaml.safe_load(example)})
+        self.assertEqual([r["id"] for r in rules], ["confidential_keyword_codename_1"])
+
+    def test_whole_word_case_insensitive_and_whitespace(self):
+        scan = self.scan()
+        label = "confidential_keyword_codename_1"
+        for text in ("Status of Reyden?", "PROJECT   REYDEN launch", "notes on project\nreyden", "(reyden)"):
+            with self.subTest(text=text):
+                self.assertIn(label, self.labels(scan, text))
+        for text in ("reydenville", "preyden", "rey den", "reyden_v2"):
+            with self.subTest(text=text):
+                self.assertNotIn(label, self.labels(scan, text))
+
+    def test_scopes_default_to_prompt_and_answer(self):
+        scan = self.scan()
+        label = "confidential_keyword_codename_1"
+        self.assertIn(label, self.labels(scan, "reyden", "answer"))
+        self.assertNotIn(label, self.labels(scan, "reyden", "tool_result"))
+        self.assertNotIn(label, self.labels(scan, "reyden", "tool_args"))
+        wide = self.scan({"version": 1, "groups": [{"id": "codename_1", "terms": ["reyden"],
+                                                    "scopes": ["tool_result"]}]})
+        self.assertIn(label, self.labels(wide, "reyden", "tool_result"))
+
+    def test_encoded_term_is_found_and_never_echoed(self):
+        scan = self.scan()
+        encoded = base64.b64encode(b"the project reyden roadmap").decode()
+        result = scan(f"decode {encoded}", "prompt")
+        hit = next(h for h in result["hits"] if h["rule_id"] == "confidential_keyword_codename_1")
+        self.assertEqual(hit["encoding"], "base64")
+        self.assertNotIn("reyden", json.dumps(result).replace("confidential_keyword_codename_1", ""))
+
+    def test_regex_metacharacters_are_literal(self):
+        scan = self.scan({"version": 1, "groups": [{"id": "deal_a", "terms": ["a.b (c)+"]}]})
+        self.assertIn("confidential_keyword_deal_a", self.labels(scan, "see a.b (c)+ now"))
+        self.assertNotIn("confidential_keyword_deal_a", self.labels(scan, "see axb (c) now"))
+
+    def test_long_term_lists_split_into_bounded_patterns(self):
+        terms = [f"term{i:03d}" + "x" * 100 for i in range(256)]
+        rules = UTILS.keyword_rules({"version": 1, "groups": [{"id": "codename_1", "terms": terms}]})
+        self.assertGreater(len(rules[0]["patterns"]), 1)
+        scan = self.scan({"version": 1, "groups": [{"id": "codename_1", "terms": terms}]})
+        self.assertIn("confidential_keyword_codename_1", self.labels(scan, terms[-1]))
+
+    def test_validation(self):
+        for groups, message in (
+            ([{"id": "project_reyden", "terms": ["reyden"]}], "contains one of its terms"),
+            ([{"id": "reyden_watch", "terms": ["project reyden", "reyden"]}], "contains one of its terms"),
+            ([{"id": "Codename", "terms": ["x"]}], "lowercase"),
+            ([{"id": "codename_1", "terms": ["x"]}, {"id": "codename_1", "terms": ["y"]}], "unique"),
+            ([{"id": "codename_1", "terms": []}], "terms"),
+            ([{"id": "codename_1", "terms": ["  "]}], "terms"),
+            ([{"id": "codename_1", "terms": ["x"], "scopes": ["any"]}], "scopes"),
+            ([{"id": "codename_1", "terms": ["x"], "score": 0}], "score"),
+            ([{"id": "codename_1", "terms": ["x"], "regex": "y"}], "mapping of id"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                UTILS.keyword_rules({"version": 1, "groups": groups})
+        # A short term that only appears inside another word of the ID is fine.
+        UTILS.keyword_rules({"version": 1, "groups": [{"id": "codename_1", "terms": ["code"]}]})
+
+
 if __name__ == "__main__":
     unittest.main()

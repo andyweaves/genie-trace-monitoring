@@ -61,6 +61,13 @@ variables:
     description: Workspace path of the security-pattern YAML used by the guardrail detector.
     default: ${workspace.file_path}/src/config/security_patterns.yml
 
+  # Confidential keyword watchlist (codenames, deal names) scanned by the guardrail detector.
+  confidential_keywords_file:
+    description: >
+      Workspace path of the confidential keyword YAML (see src/config/confidential_keywords.yml).
+      The shipped file has no groups; blank turns the watchlist off.
+    default: ${workspace.file_path}/src/config/confidential_keywords.yml
+
   # Volume used to stage wheels (spaCy model for Presidio).
   libs_volume:
     default: genie_tracing_libs

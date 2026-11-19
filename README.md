@@ -8,7 +8,7 @@ MITRE ATT&CK and ATLAS, so they arrive as signals and alerts in your SIEM workfl
 
 Everything is a [Databricks Asset Bundle](https://docs.databricks.com/dev-tools/bundles/):
 two serverless Lakeflow pipelines, two jobs (one-time setup and hourly monitoring), eight notebooks
-a session investigation dashboard and a catalog of 23 Lakewatch detection rules, deployable to any workspace with a single
+a session investigation dashboard and a catalog of 27 Lakewatch detection rules, deployable to any workspace with a single
 `databricks bundle deploy`.
 
 ## Contents
@@ -142,7 +142,7 @@ processing (`CREATE OR REFRESH STREAMING TABLE ... FROM STREAM(...)`).
 | Pipeline `genie_tracing_sessions` | `src/pipelines/sessions/` | `genie_sessions`, `genie_session_timeline` |
 | Job `genie_tracing_setup` | `resources/genie_tracing_setup.job.yml` | One-time: `00_setup` → `01_deploy_prompt_guard` and `07_deploy_lakewatch_rules`, parameterised from the bundle variables. Run on demand, and again after editing the rule catalog. |
 | Job `genie_tracing_monitoring` | `resources/genie_tracing_monitoring.job.yml` | ETL → 3 detection notebooks → sessions. Hourly, paused by default. |
-| Lakewatch detection rules | `src/lakewatch/rule_catalog.yml` | 23 rules over `genie_detections` / `genie_sessions`, created through the Lakewatch rules API by `07_deploy_lakewatch_rules` (there is no bundle resource for them). See [Lakewatch detection rules](#lakewatch-detection-rules). |
+| Lakewatch detection rules | `src/lakewatch/rule_catalog.yml` | 27 rules over `genie_detections` / `genie_sessions`, created through the Lakewatch rules API by `07_deploy_lakewatch_rules` (there is no bundle resource for them). See [Lakewatch detection rules](#lakewatch-detection-rules). |
 | Dashboard "Genie session investigation" | `resources/genie_tracing_investigation.dashboard.yml` | One page: session risk, step-by-step timeline with text, and the findings behind each flag, filtered by conversation. Every Lakewatch signal links to it (`dashboard_url`). |
 | SQL alert "new Lakewatch signals" | `resources/genie_tracing_lakewatch_email.alert.yml` | Hourly email digest of new signals at or above `lakewatch_email_min_severity` from these rules, read from the Lakewatch signals view (Lakewatch itself does not send email). Rule, severity, summary and identifiers only, never prompt text. |
 
@@ -154,7 +154,7 @@ processing (`CREATE OR REFRESH STREAMING TABLE ... FROM STREAM(...)`).
 | `01_deploy_prompt_guard.py` | Get Llama Prompt Guard 2 weights (from Hugging Face, or copied out of a Prompt Guard model already registered in UC), log a batch-scoring pyfunc with 512-token chunking, deploy endpoint `genie-prompt-guard-2` |
 | `02_detect_pii.py` | Presidio pandas UDF (row-level) with a context-gated `DATE_OF_BIRTH` recogniser, severity weighting by entity type (re-applied to history every run), optional `ai_extract` comparison, Data Classification results, apply governed `class.*` tags |
 | `03_detect_prompt_injection.py` | `ai_query` to Prompt Guard over prompts and tool results, `ai_classify` second opinion, disagreement review |
-| `04_detect_guardrail_signals.py` | Outcome/wording rules, deterministic security signatures with bounded decoding, and repeated-call / long-turn checks; no new AI calls |
+| `04_detect_guardrail_signals.py` | Outcome/wording rules, deterministic security signatures with bounded decoding, the confidential keyword watchlist, and repeated-call / long-turn checks; no new AI calls |
 | `05_session_explorer.py` | Adoption, flagged sessions, session walkthrough, approval flows, tool usage, thumbs-down |
 | `06_table_guide.py` | Guided tour of every table in triage order, with a brief and a runnable query per table. **Start here if you are new to the schema.** |
 | `07_deploy_lakewatch_rules.py` | Validate the Lakewatch rule catalog, preview each rule over recent data, then create / update the rules through the Lakewatch API (`dry_run` prints the YAML for the UI instead) |
@@ -249,6 +249,7 @@ Variables you will most likely override (in `databricks.local.yml` or with `--va
 | `genie_one_services` | `Genie One,GenieOne,data-rooms` | Comma-separated `service_name` values for Genie One spans (see [What the trace contains](#what-the-trace-does-and-does-not-contain)) |
 | `pii_allowlist_files` | `src/config/pii_allowlist.yml` | Comma-separated workspace paths of PII allowlist YAML files, merged (see [Tuning](#tuning)) |
 | `security_patterns_file` | `src/config/security_patterns.yml` | Workspace path of deterministic security signatures, scan limits, and optional runaway thresholds |
+| `confidential_keywords_file` | `src/config/confidential_keywords.yml` | Workspace path of the confidential keyword watchlist (ships empty; blank turns it off). See [Tuning](#tuning) |
 | `prompt_guard_model_source` | `huggingface` | How `genie_tracing_setup` gets the Prompt Guard weights: `huggingface` (secret `hf_secret_scope` / `hf_secret_key`, default `genie_tracing` / `hf_token`) or `uc_model` (`prompt_guard_source_uc_model`) |
 | `prompt_guard_endpoint` | `genie-prompt-guard-2` | Endpoint created by `01_deploy_prompt_guard` |
 | `detection_lookback_days` | `7` | How far back each run re-evaluates |
@@ -344,7 +345,7 @@ Weights live in `src/pipelines/sessions/transformations/genie_sessions.sql`.
 ## Lakewatch detection rules
 
 The detectors write findings; [Lakewatch](https://docs.databricks.com/aws/en/lakewatch/) decides
-who hears about them. `src/lakewatch/rule_catalog.yml` defines 23 detection rules that promote
+who hears about them. `src/lakewatch/rule_catalog.yml` defines 27 detection rules that promote
 findings from `genie_detections` (and the composite score in `genie_sessions`) into Lakewatch
 signals and alerts. Each rule has a severity, fidelity, category, MITRE ATT&CK and ATLAS mappings,
 OWASP and DASF annotations, an objective and a Markdown runbook. The notebooks stay the detection
@@ -363,19 +364,42 @@ rules decide what becomes a signal and how it is classified.
 * **New findings only.** Rules filter on `IN_TIMERANGE(detected_at)`. `detected_at` only moves when
   a finding appears or its score rises, so the hourly re-scan does not re-signal. `extend_lookback:
   2h` covers the monitoring job's run time, and 24-hour deduplication absorbs the overlap.
-* **Four kinds of rule.** `match` rules select findings by detector, label, source field and score.
+* **Five kinds of rule.** `match` rules select findings by detector, label (or label prefix, for
+  the customer-named `confidential_keyword_*` groups), source field and score.
   `genie_lethal_trifecta` is a `chain`, and the only Critical rule (see below).
   `genie_injection_then_action` (High) is a `sequence`: an injection finding followed in the same
   conversation by exfiltration, secret access, privilege change, obfuscated execution or a
   destructive action, searched over seven days. `genie_pii_combination`
   (a name with a date of birth, phone number or location) and `genie_high_risk_session`
   (`risk_score` ≥ 0.8, the replacement for the old "sessions to review" SQL alert) are `custom` SQL.
+  `genie_repeat_offender`, `genie_agent_stuck_on_block` and `genie_approval_spike` are `rate`
+  rules (see [Volume per requester](#volume-per-requester)).
 * **Taxonomies.** `mitre-attack` uses Enterprise ATT&CK v20 tactic names (Stealth and Defense
   Impairment replaced Defense Evasion). `mitre-atlas` uses ATLAS 5.6, which has agent-specific
   techniques such as AML.T0086 *Exfiltration via AI Agent Tool Invocation* and AML.T0101 *Data
   Destruction via AI Agent Tool Invocation*. Frameworks go in `annotations` (`owasp_llm_top10`,
   `owasp_agentic_top10`, `dasf_risks`, `mitre_techniques`) and are repeated in the objective.
   `tests/verify_mitre_mappings.py` checks every ID, name and tactic against the published MITRE data.
+
+### Volume per requester
+
+A single block, refusal or approval request is routine. Many from one person in a short time is
+probing, a stuck agent or approval fatigue. `rate` rules count distinct turns or tool-call spans
+per requester (and optionally per tool), across all of their conversations, in any sliding
+window, not clock hours, so a burst from 10:40 to 11:30 still counts as one hour.
+
+| Rule | Counts | Threshold |
+|---|---|---|
+| `genie_repeat_offender` | Turns with a guardrail intervention, a policy-blocked or permission-denied tool call, or a refusal | 5 turns per requester in 1 hour |
+| `genie_agent_stuck_on_block` | Tool calls that were policy-blocked, permission-denied or met with "Action denied" | 5 calls of one tool per requester in 1 hour |
+| `genie_approval_spike` | Approval requests (unflagged findings, otherwise not signalled) | 10 per requester in 1 hour |
+
+These rules send one signal per requester (and tool), not per conversation. `conversation_id`, the
+dashboard link and `investigate` point to the latest conversation in the burst, and the runbook's
+triage section lists the query for the requester's other findings. A burst only signals when it
+contains a finding that is new in the run, and because the rules read detector output, a signal
+arrives up to about two hours after the activity. Change `threshold`, `window` (`30m`, `1h`, up to
+`24h`) and `per` in the catalog.
 
 ### The lethal trifecta
 
@@ -440,12 +464,16 @@ runs in (override with `workspace_url`). Without a dashboard ID the link columns
 | `genie_sensitive_pii` | High | Medium | – | AML.T0057 | LLM02 | 9.10, 10.6 |
 | `genie_personal_data` | Low | Investigative | – | AML.T0057 | LLM02 | 9.10 |
 | `genie_pii_combination` | Medium | Investigative | – | AML.T0057 | LLM02 | 9.10 |
+| `genie_confidential_keyword` | Medium | Medium | – | AML.T0057 | LLM02 | 9.10, 10.6 |
+| `genie_repeat_offender` | Medium | Medium | – | AML.T0054 | LLM01, ASI01 | 9.1 |
+| `genie_agent_stuck_on_block` | Medium | Medium | – | AML.T0034.002, AML.T0053 | LLM06, ASI02 | 13.2, 13.4 |
+| `genie_approval_spike` | Low | Investigative | – | AML.T0053 | LLM06, ASI09 | – |
 | `genie_lethal_trifecta` | Critical | High | T1567 | AML.T0051, AML.T0057, AML.T0077, AML.T0086 | LLM01, LLM02, LLM06, ASI01, ASI02 | 13.16, 13.23, 10.6 |
 | `genie_injection_then_action` | High | High | – | AML.T0051, AML.T0053, AML.T0086, AML.T0098, AML.T0101 | LLM01, LLM06, ASI01, ASI02 | 13.6, 13.17, 13.23 |
 | `genie_high_risk_session` | High | Medium | – | – | LLM01, LLM02, LLM06 | 10.1 |
 
 `not_signalled` in the catalog lists the informational detector outputs deliberately left out
-(`approval_requested`, `turn_error`, `tool_error`, `cancelled_or_aborted`, `security_scan_limited`,
+(`approval_requested`, which only signals in volume through `genie_approval_spike`, `turn_error`, `tool_error`, `cancelled_or_aborted`, `security_scan_limited`,
 `trace_completeness_warning`, `markdown_data_image`). `tests/test_lakewatch_rules.py` fails if a
 guardrail rule or security signature is neither covered by a rule nor listed there, and if the
 catalog names a label the detectors never write.
@@ -532,6 +560,14 @@ rather than per grouped alert, a busy session can appear on several rows.
   Rules have explicit scopes, scores and flagged/informational status. Configuration is validated;
   a malformed pattern fails the task rather than silently removing coverage. The whole guardrail
   lookback is re-scored, clearing removed hits without re-alerting on unchanged findings.
+* **Confidential keywords**: list codenames, deal names or customer names that should never reach
+  Genie in `src/config/confidential_keywords.yml`, or point `confidential_keywords_file` at your
+  own copy to keep the list out of the repository. Each group has a neutral `id` (it appears in
+  signals, so loading fails if it contains one of the terms), its `terms`, and optional `scopes`
+  (default prompt and answer; add `tool_args` / `tool_result` to look in code and data) and
+  `score` (default 0.6). Terms match whole words, case-insensitively, also inside base64, URL or
+  JSON encoding. Findings and `genie_confidential_keyword` signals carry
+  `confidential_keyword_<id>`, never the matched term. A change re-scans the lookback window.
 * **Guardrail wording**: extend `INTERVENTION_PATTERNS`, `REFUSAL_PATTERNS`, `BOUNDARY_PROMPT_REGEX`,
   `MARKDOWN_EXFIL_REGEX`, `CONFIRMATION_REGEX` and `DESTRUCTIVE_EXECUTED_REGEX` in
   `04_detect_guardrail_signals` as you see new phrasing. The
@@ -683,7 +719,7 @@ Verified against live traces in November 2026. These shape what the detectors ca
 ├── src/
 │   ├── pipelines/etl/transformations/        genie_turns.sql, genie_tool_calls.sql
 │   ├── pipelines/sessions/transformations/   genie_sessions.sql, genie_session_timeline.sql
-│   ├── config/                               PII allowlists + deterministic security signatures
+│   ├── config/                               PII allowlists, security signatures, confidential keyword watchlist
 │   ├── lakewatch/rule_catalog.yml            Lakewatch detection rules: SQL, MITRE, frameworks, runbooks
 │   ├── dashboards/                           genie_session_investigation.lvdash.json
 │   ├── notebooks/                            00 … 07 + shared detection / security / Lakewatch helpers, images/
